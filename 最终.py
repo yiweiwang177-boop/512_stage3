@@ -1972,6 +1972,7 @@ def compute_slice_traditional_lcd_lcci(slice_id, bmo_lr, ali_lr, alcs_pts):
         'scan_angle_deg': float((int(slice_id) - 1) * 15.0),
         'fit_method': 'none',
         'fit_status': 'fit_failed',
+        'lcd_status': 'not_evaluated',
         'fit_quality': np.nan,
         'Length_D_mm': np.nan,
         'Area_S_mm2': np.nan,
@@ -2038,11 +2039,6 @@ def compute_slice_traditional_lcd_lcci(slice_id, bmo_lr, ali_lr, alcs_pts):
     area_s = float(np.trapezoid(np.abs(y_fit), x_fit))
     lcd_area = area_s / D
 
-    idx_deep = int(np.argmax(np.abs(y_fit)))
-    x_deep = float(x_fit[idx_deep])
-    y_deep = float(y_fit[idx_deep])
-    lcd_direct = float(abs(y_deep))
-
     left_ali = np.array(ali_lr['L']['point_3d'], dtype=float)
     right_ali = np.array(ali_lr['R']['point_3d'], dtype=float)
     ali_uv = project_points_with_slice_context(np.vstack([left_ali, right_ali]), ctx)
@@ -2050,32 +2046,65 @@ def compute_slice_traditional_lcd_lcci(slice_id, bmo_lr, ali_lr, alcs_pts):
         row['reason'] = 'ALI projection failed'
         return row, None
 
+    ali_u_min = float(np.nanmin(ali_uv[:, 0]))
+    ali_u_max = float(np.nanmax(ali_uv[:, 0]))
+    valid_deep_mask = (
+        np.isfinite(x_fit) &
+        np.isfinite(y_fit) &
+        (x_fit >= ali_u_min) &
+        (x_fit <= ali_u_max)
+    )
+
+    x_deep = np.nan
+    y_deep = np.nan
+    lcd_direct = np.nan
+    deepest_uv = None
+    lcd_line_uv = None
+    deepest_xyz = None
+    lcd_status = 'no_valid_deepest_within_ali'
+
+    if np.any(valid_deep_mask):
+        x_fit_valid = x_fit[valid_deep_mask]
+        y_fit_valid = y_fit[valid_deep_mask]
+        idx_deep = int(np.argmax(np.abs(y_fit_valid)))
+        x_deep = float(x_fit_valid[idx_deep])
+        y_deep = float(y_fit_valid[idx_deep])
+        lcd_direct = float(abs(y_deep))
+        deepest_uv = np.array([x_deep, y_deep], dtype=float)
+        lcd_line_uv = np.array([[x_deep, 0.0], [x_deep, y_deep]], dtype=float)
+        deepest_xyz = (
+            uv_to_aligned_3d(deepest_uv, uv_to_xyz_coef)
+            if uv_to_xyz_coef is not None else None
+        )
+        lcd_status = 'ali_bounded_valid'
+
     ALID1 = float(abs(ali_uv[0, 1]))
     ALID2 = float(abs(ali_uv[1, 1]))
     mALID = 0.5 * (ALID1 + ALID2)
 
     LCCI_area = lcd_area - mALID
-    LCCI_direct = lcd_direct - mALID
+    LCCI_direct = (lcd_direct - mALID) if np.isfinite(lcd_direct) else np.nan
     aLCCI_area = (LCCI_area / D) * 100.0
-    aLCCI_direct = (LCCI_direct / D) * 100.0
+    aLCCI_direct = (LCCI_direct / D) * 100.0 if np.isfinite(LCCI_direct) else np.nan
 
     row.update({
         'fit_method': fit_method,
         'fit_status': fit_status,
+        'lcd_status': lcd_status,
         'fit_quality': fit_quality,
         'Length_D_mm': float(D),
         'Area_S_mm2': area_s,
         'LCD_area_mm': float(lcd_area),
-        'LCD_direct_mm': float(lcd_direct),
+        'LCD_direct_mm': float(lcd_direct) if np.isfinite(lcd_direct) else np.nan,
         'ALID1_mm': ALID1,
         'ALID2_mm': ALID2,
         'mALID_mm': float(mALID),
         'LCCI_area_mm': float(LCCI_area),
-        'LCCI_direct_mm': float(LCCI_direct),
+        'LCCI_direct_mm': float(LCCI_direct) if np.isfinite(LCCI_direct) else np.nan,
         'aLCCI_area_pct': float(aLCCI_area),
-        'aLCCI_direct_pct': float(aLCCI_direct),
+        'aLCCI_direct_pct': float(aLCCI_direct) if np.isfinite(aLCCI_direct) else np.nan,
         'status': 'PASS',
-        'reason': '',
+        'reason': '' if lcd_status == 'ali_bounded_valid' else 'no_valid_deepest_within_ali',
     })
 
     plot_payload = {
@@ -2089,18 +2118,19 @@ def compute_slice_traditional_lcd_lcci(slice_id, bmo_lr, ali_lr, alcs_pts):
         'uv_to_xyz_coef': uv_to_xyz_coef,
         'bmo_uv': np.array([[0.0, 0.0], [D, 0.0]], dtype=float),
         'ali_uv': ali_uv,
+        'ali_valid_interval_uv': np.array([ali_u_min, ali_u_max], dtype=float),
         'bmo_lr_xyz': np.vstack([left_bmo, right_bmo]),
         'ali_lr_xyz': np.vstack([left_ali, right_ali]),
-        'deepest_uv': np.array([x_deep, y_deep], dtype=float),
-        'lcd_line_uv': np.array([[x_deep, 0.0], [x_deep, y_deep]], dtype=float),
+        'deepest_uv': deepest_uv,
+        'lcd_line_uv': lcd_line_uv,
         'alid_lines_uv': np.array([
             [[ali_uv[0, 0], 0.0], [ali_uv[0, 0], ali_uv[0, 1]]],
             [[ali_uv[1, 0], 0.0], [ali_uv[1, 0], ali_uv[1, 1]]],
         ], dtype=float),
-        'deepest_xyz': uv_to_aligned_3d(np.array([x_deep, y_deep], dtype=float), uv_to_xyz_coef)
-        if uv_to_xyz_coef is not None else None,
+        'deepest_xyz': deepest_xyz,
         'fit_method': fit_method,
         'fit_status': fit_status,
+        'lcd_status': lcd_status,
         'fit_quality': fit_quality,
     }
 
@@ -2127,6 +2157,7 @@ def compute_traditional_lcd_lcci_all_slices(aligned_cloud):
                          'status': 'FAIL', 'reason': 'missing BMO',
                          'fit_method': 'none', 'fit_quality': np.nan,
                          'fit_status': 'fit_failed',
+                         'lcd_status': 'not_evaluated',
                          'Length_D_mm': np.nan, 'Area_S_mm2': np.nan,
                          'LCD_area_mm': np.nan, 'LCD_direct_mm': np.nan,
                          'ALID1_mm': np.nan, 'ALID2_mm': np.nan, 'mALID_mm': np.nan,
@@ -2138,6 +2169,7 @@ def compute_traditional_lcd_lcci_all_slices(aligned_cloud):
                          'status': 'FAIL', 'reason': 'missing ALI',
                          'fit_method': 'none', 'fit_quality': np.nan,
                          'fit_status': 'fit_failed',
+                         'lcd_status': 'not_evaluated',
                          'Length_D_mm': np.nan, 'Area_S_mm2': np.nan,
                          'LCD_area_mm': np.nan, 'LCD_direct_mm': np.nan,
                          'ALID1_mm': np.nan, 'ALID2_mm': np.nan, 'mALID_mm': np.nan,
@@ -2149,6 +2181,7 @@ def compute_traditional_lcd_lcci_all_slices(aligned_cloud):
                          'status': 'FAIL', 'reason': 'missing ALCS',
                          'fit_method': 'none', 'fit_quality': np.nan,
                          'fit_status': 'fit_failed',
+                         'lcd_status': 'not_evaluated',
                          'Length_D_mm': np.nan, 'Area_S_mm2': np.nan,
                          'LCD_area_mm': np.nan, 'LCD_direct_mm': np.nan,
                          'ALID1_mm': np.nan, 'ALID2_mm': np.nan, 'mALID_mm': np.nan,
@@ -2345,7 +2378,8 @@ def save_slice_qc_figures(payload_map, mrw_segments_list, gardiner_local_list, o
             _draw_line_if_valid(img, bmo_px, hit_px, color=(60, 30, 200), thickness=1)
 
         fit_status = p.get('fit_status', 'na') if p is not None else 'na'
-        cv2.putText(img, f"slice {int(sid):02d}  fit:{fit_status}",
+        lcd_status = p.get('lcd_status', 'na') if p is not None else 'na'
+        cv2.putText(img, f"slice {int(sid):02d}  fit:{fit_status}  lcd:{lcd_status}",
                     (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (245, 245, 245), 2, cv2.LINE_AA)
 
         out_path = os.path.join(output_dir, f'slice_{int(sid):02d}_qc.png')
@@ -2589,7 +2623,7 @@ def prepare_lcd_lcci_dataframe(lcd_lcci_df, payload_map, final_cloud, aligned_cl
             'slice_id', 'scan_angle_deg', 'length_D_mm', 'area_S_mm2',
             'lcd_area_mm', 'lcd_direct_mm', 'alid1_mm', 'alid2_mm', 'malid_mm',
             'lcci_area_mm', 'lcci_direct_mm', 'alcci_area_percent', 'alcci_direct_percent',
-            'fit_method', 'fit_status', 'fit_quality', 'status', 'reason',
+            'fit_method', 'fit_status', 'lcd_status', 'fit_quality', 'status', 'reason',
             'bmo_left_x_px', 'bmo_left_y_px', 'bmo_right_x_px', 'bmo_right_y_px',
             'ali_left_x_px', 'ali_left_y_px', 'ali_right_x_px', 'ali_right_y_px',
             'deepest_x_px', 'deepest_y_px',
@@ -2672,7 +2706,7 @@ def prepare_lcd_lcci_dataframe(lcd_lcci_df, payload_map, final_cloud, aligned_cl
         'slice_id', 'scan_angle_deg', 'length_D_mm', 'area_S_mm2',
         'lcd_area_mm', 'lcd_direct_mm', 'alid1_mm', 'alid2_mm', 'malid_mm',
         'lcci_area_mm', 'lcci_direct_mm', 'alcci_area_percent', 'alcci_direct_percent',
-        'fit_method', 'fit_status', 'fit_quality', 'status', 'reason',
+        'fit_method', 'fit_status', 'lcd_status', 'fit_quality', 'status', 'reason',
         'bmo_left_x_px', 'bmo_left_y_px', 'bmo_right_x_px', 'bmo_right_y_px',
         'ali_left_x_px', 'ali_left_y_px', 'ali_right_x_px', 'ali_right_y_px',
         'deepest_x_px', 'deepest_y_px',
