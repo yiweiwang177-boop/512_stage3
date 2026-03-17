@@ -1,0 +1,23 @@
+# 1. 忽略所有自动生成的结果文件夹
+auto_ilm_results*/
+pseudocolor/
+
+# 2. 忽略重型的 DICOM 医疗影像原始数据
+*.dcm
+
+# 3. 忽略 Python 缓存垃圾
+__pycache__/
+*.pyc
+
+# 4. 忽略报告和图表数据
+*.png
+*.jpg
+*.xlsx
+*.csv
+*.md
+*.json
+*.iml
+*.xml
+*.name
+*.idea
+*.xls
