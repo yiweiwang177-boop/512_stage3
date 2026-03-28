@@ -53,6 +53,22 @@ def load_stage3_main_module():
     return module
 
 
+def load_stage3_main_module():
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        path
+        for path in root.glob("*.py")
+        if path.name not in {"stage3_input_adapter.py", "stage3_shared.py", "stage3_canonical_access.py"}
+        and "pre" not in path.name.lower()
+    ]
+    assert len(candidates) == 1
+    spec = importlib.util.spec_from_file_location("stage3_main_module", str(candidates[0]))
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 class Stage3InputAdapterTests(unittest.TestCase):
     def setUp(self):
         workspace_tmp = Path(__file__).resolve().parents[1] / "tests_tmp"

@@ -864,6 +864,9 @@ def split_slice_ilm_into_left_right(slice_items):
 
 
 def build_slice_ilm_segment_dict(ilm_meta):
+    # Legacy fallback only. Canonical MRW semantics should come from full ILM
+    # via the shared structure; this helper only reconstructs old short-ROI
+    # segments when compat meta is the only available input.
     slice_dict = {}
     for item in ilm_meta:
         sid = item['slice_id']
@@ -1050,7 +1053,62 @@ def ray_segment_intersection_2d(ray_dir, p0, p1, eps=1e-10):
     return None
 
 
-def intersect_ray_with_polyline_in_slice_2d(origin_3d, ref_dir_xy, polyline_3d, angle_deg):
+MRA_RAY_T_EPSILON_MM = 1e-4
+
+
+def _normalize_vec2(vec, eps=1e-12):
+    arr = np.asarray(vec, dtype=float)
+    norm = np.linalg.norm(arr)
+    if norm < eps:
+        return None
+    return arr / norm
+
+
+def build_mra_ray_dir_local(phi_signed_deg):
+    phi_rad = np.deg2rad(float(phi_signed_deg))
+    return np.array([np.sin(phi_rad), np.cos(phi_rad)], dtype=float)
+
+
+def canonicalize_mra_tangent_2d(tangent_2d):
+    tangent_hat = _normalize_vec2(tangent_2d)
+    if tangent_hat is None:
+        return None
+    if tangent_hat[0] < -1e-12 or (
+        abs(tangent_hat[0]) <= 1e-12 and tangent_hat[1] < 0
+    ):
+        tangent_hat = -tangent_hat
+    return tangent_hat
+
+
+def compute_mra_phi_signed_deg(ray_dir_2d, segment_p0_2d, segment_p1_2d):
+    ray_hat = _normalize_vec2(ray_dir_2d)
+    tangent_hat = canonicalize_mra_tangent_2d(
+        np.asarray(segment_p1_2d, dtype=float) - np.asarray(segment_p0_2d, dtype=float)
+    )
+    if ray_hat is None or tangent_hat is None:
+        return np.nan
+
+    normal_candidates = [
+        np.array([-tangent_hat[1], tangent_hat[0]], dtype=float),
+        np.array([tangent_hat[1], -tangent_hat[0]], dtype=float),
+    ]
+    normal_hat = max(normal_candidates, key=lambda item: float(np.dot(item, ray_hat)))
+    normal_hat = _normalize_vec2(normal_hat)
+    if normal_hat is None:
+        return np.nan
+
+    tangent_component = float(np.dot(ray_hat, tangent_hat))
+    normal_component = float(np.dot(ray_hat, normal_hat))
+    return float(np.degrees(np.arctan2(tangent_component, normal_component)))
+
+
+def intersect_ray_with_polyline_in_slice_2d(
+    origin_3d,
+    ref_dir_xy,
+    polyline_3d,
+    phi_signed_deg,
+    ray_t_epsilon_mm=MRA_RAY_T_EPSILON_MM,
+):
     """
     在当前 B-scan 的 2D 截面中，求从 BMO 点出发、
     与参考线夹角为 angle_deg 的射线，与 ILM 折线的最近交点。
@@ -1063,17 +1121,17 @@ def intersect_ray_with_polyline_in_slice_2d(origin_3d, ref_dir_xy, polyline_3d, 
     """
     polyline_3d = np.asarray(polyline_3d, dtype=float)
     if len(polyline_3d) < 2:
-        return None, None
+        return None, None, None
 
     poly2d = convert_points_to_slice_ref_2d(polyline_3d, origin_3d, ref_dir_xy)
     if poly2d is None or len(poly2d) < 2:
-        return None, None
+        return None, None, None
 
-    theta = np.deg2rad(angle_deg)
-    ray_dir = np.array([np.cos(theta), np.sin(theta)], dtype=float)
+    ray_dir = build_mra_ray_dir_local(phi_signed_deg)
 
     best_t = np.inf
     best_hit = None
+    best_meta = None
 
     for i in range(len(poly2d) - 1):
         p0 = poly2d[i]
@@ -1083,15 +1141,25 @@ def intersect_ray_with_polyline_in_slice_2d(origin_3d, ref_dir_xy, polyline_3d, 
             continue
 
         t, u = hit
+        if t <= float(ray_t_epsilon_mm):
+            continue
+
         if t < best_t:
             seg_pt_3d = polyline_3d[i] + u * (polyline_3d[i + 1] - polyline_3d[i])
             best_t = t
             best_hit = seg_pt_3d
+            best_meta = {
+                'segment_index': int(i),
+                'segment_u': float(u),
+                'segment_p0_2d': np.asarray(p0, dtype=float),
+                'segment_p1_2d': np.asarray(p1, dtype=float),
+                'ray_dir_2d': np.asarray(ray_dir, dtype=float),
+            }
 
     if best_hit is None:
-        return None, None
+        return None, None, None
 
-    return float(best_t), np.asarray(best_hit, dtype=float)
+    return float(best_t), np.asarray(best_hit, dtype=float), best_meta
 
 
 def calculate_gardiner_mra(aligned_cloud, n_sectors=24, phi_step_deg=0.5):
@@ -1111,7 +1179,8 @@ def calculate_gardiner_mra(aligned_cloud, n_sectors=24, phi_step_deg=0.5):
         return [], 0.0
 
     # Canonical shared data is the primary input path in this pass.
-    # Compat meta remains a temporary fallback only; MRA formulas stay unchanged.
+    # Signed-angle search is normalized in the local slice frame; compat meta
+    # remains only a temporary fallback and the report schema stays unchanged.
     shared_case = get_shared_case(aligned_cloud)
     if shared_case is not None and aligned_cloud.get('ALIGNMENT') is not None:
         canonical_geom = build_aligned_canonical_slice_geometry(shared_case, aligned_cloud['ALIGNMENT'])
@@ -1213,20 +1282,31 @@ def calculate_gardiner_mra(aligned_cloud, n_sectors=24, phi_step_deg=0.5):
                 continue
 
             best_area_mm2 = np.inf
+            best_phi_signed_deg = None
             best_phi_deg = None
             best_rw_phi_mm = None
             best_top_len_mm = None
             best_hit_pt = None
+            best_hit_meta = None
 
-            phi_values = np.arange(0.0, 90.0 + phi_step_deg, phi_step_deg)
+            phi_values = np.arange(-90.0, 90.0 + 0.5 * phi_step_deg, phi_step_deg)
 
-            for phi_deg in phi_values:
-                rw_phi_mm, hit_pt = intersect_ray_with_polyline_in_slice_2d(
-                    bmo_pt, side_ref_dir_xy, ilm_polyline, phi_deg
+            for phi_search_deg in phi_values:
+                rw_phi_mm, hit_pt, hit_meta = intersect_ray_with_polyline_in_slice_2d(
+                    bmo_pt, side_ref_dir_xy, ilm_polyline, phi_search_deg
                 )
                 if rw_phi_mm is None:
                     continue
 
+                phi_signed_deg = compute_mra_phi_signed_deg(
+                    hit_meta['ray_dir_2d'],
+                    hit_meta['segment_p0_2d'],
+                    hit_meta['segment_p1_2d'],
+                )
+                if not np.isfinite(phi_signed_deg):
+                    continue
+
+                phi_deg = abs(float(phi_signed_deg))
                 phi_rad = np.deg2rad(phi_deg)
 
                 top_radius_mm = r_mm - rw_phi_mm * np.cos(phi_rad)
@@ -1239,14 +1319,30 @@ def calculate_gardiner_mra(aligned_cloud, n_sectors=24, phi_step_deg=0.5):
 
                 area_mm2 = 0.5 * (bottom_len_mm + top_len_mm) * rw_phi_mm
 
-                if area_mm2 < best_area_mm2:
+                if (
+                    area_mm2 < best_area_mm2 - 1e-12 or
+                    (
+                        np.isfinite(best_area_mm2) and
+                        abs(area_mm2 - best_area_mm2) <= 1e-12 and
+                        (
+                            best_phi_signed_deg is None or
+                            abs(phi_signed_deg) < abs(best_phi_signed_deg)
+                        )
+                    )
+                ):
                     best_area_mm2 = area_mm2
+                    best_phi_signed_deg = float(phi_signed_deg)
                     best_phi_deg = phi_deg
                     best_rw_phi_mm = rw_phi_mm
                     best_top_len_mm = top_len_mm
                     best_hit_pt = hit_pt
+                    best_hit_meta = hit_meta
 
-            if best_phi_deg is None or not np.isfinite(best_area_mm2):
+            if (
+                best_phi_signed_deg is None or
+                best_phi_deg is None or
+                not np.isfinite(best_area_mm2)
+            ):
                 continue
 
             gardiner_local_list.append({
@@ -1256,12 +1352,14 @@ def calculate_gardiner_mra(aligned_cloud, n_sectors=24, phi_step_deg=0.5):
                 'anatomical_angle_deg': float(anatomical_angle_deg(bmo_pt[0], bmo_pt[1])),
                 'r_mm': float(r_mm),
                 'bottom_len_mm': float(bottom_len_mm),
+                'phi_signed_deg': float(best_phi_signed_deg),
                 'mra_phi_deg': float(best_phi_deg),
                 'rw_phi_um': float(best_rw_phi_mm * 1000.0),
                 'top_len_mm': float(best_top_len_mm),
                 'local_area_mm2': float(best_area_mm2),
                 'bmo_pt': tuple(bmo_pt.tolist()),
-                'ilm_hit_pt': tuple(best_hit_pt.tolist()) if best_hit_pt is not None else None
+                'ilm_hit_pt': tuple(best_hit_pt.tolist()) if best_hit_pt is not None else None,
+                'ray_dir_2d': tuple(best_hit_meta['ray_dir_2d'].tolist()) if best_hit_meta is not None else None,
             })
 
             global_mra_mm2 += best_area_mm2
@@ -2152,6 +2250,9 @@ def fit_alcs_quadratic_fallback(points_2d):
 
 
 def compute_slice_traditional_lcd_lcci(slice_id, bmo_lr, ali_lr, alcs_pts):
+    # Canonical semantics are primary in this pass:
+    # ali_lr = cutoff endpoints, alcs_pts = cutoff-cropped effective RNFL lower
+    # segment. Variable names are kept only as local compatibility aliases.
     row = {
         'slice_id': int(slice_id),
         'scan_angle_deg': float((int(slice_id) - 1) * 15.0),
@@ -2335,7 +2436,7 @@ def compute_traditional_lcd_lcci_all_slices(aligned_cloud):
     if shared_case is not None and aligned_cloud.get('ALIGNMENT') is not None:
         canonical_geom = build_aligned_canonical_slice_geometry(shared_case, aligned_cloud['ALIGNMENT'])
         bmo_dict = {sid: geom['bmo_lr'] for sid, geom in canonical_geom.items()}
-        # Local alias preserved to minimize diff; source of truth is canonical cutoff points.
+        # Local alias preserved to minimize diff; source of truth is canonical cutoff endpoints.
         ali_dict = {sid: geom['cutoff_lr'] for sid, geom in canonical_geom.items()}
         # Local alias preserved to minimize diff; source of truth is canonical effective RNFL lower segment.
         alcs_dict = {sid: geom['rnfl_effective_seg'] for sid, geom in canonical_geom.items()}
@@ -2368,7 +2469,7 @@ def compute_traditional_lcd_lcci_all_slices(aligned_cloud):
             continue
         if sid not in ali_dict:
             rows.append({'slice_id': int(sid), 'scan_angle_deg': float((int(sid) - 1) * 15.0),
-                         'status': 'FAIL', 'reason': 'missing ALI',
+                         'status': 'FAIL', 'reason': 'missing cutoff endpoints',
                          'fit_method': 'none', 'fit_quality': np.nan,
                          'fit_status': 'fit_failed',
                          'lcd_status': 'not_evaluated',
@@ -2380,7 +2481,7 @@ def compute_traditional_lcd_lcci_all_slices(aligned_cloud):
             continue
         if sid not in alcs_dict:
             rows.append({'slice_id': int(sid), 'scan_angle_deg': float((int(sid) - 1) * 15.0),
-                         'status': 'FAIL', 'reason': 'missing ALCS',
+                         'status': 'FAIL', 'reason': 'missing effective RNFL lower segment',
                          'fit_method': 'none', 'fit_quality': np.nan,
                          'fit_status': 'fit_failed',
                          'lcd_status': 'not_evaluated',
