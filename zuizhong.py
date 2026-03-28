@@ -2,8 +2,10 @@ import argparse
 import json
 import os
 import math
+import re
 import sys
 import shutil
+import unicodedata
 import cv2
 import numpy as np
 import pandas as pd
@@ -2862,7 +2864,7 @@ def prepare_mra_dataframe(gardiner_local_list, final_cloud, aligned_cloud):
     if not gardiner_local_list:
         cols = [
             'slice_id', 'side', 'scan_angle_deg', 'anatomical_angle_deg', 'r_mm',
-            'bottom_len_mm', 'mra_phi_deg', 'rw_phi_um', 'top_len_mm', 'local_area_mm2',
+            'bottom_len_mm', 'phi_signed_deg', 'mra_phi_deg', 'rw_phi_um', 'top_len_mm', 'local_area_mm2',
             'bmo_x_px', 'bmo_y_px', 'ilm_hit_x_px', 'ilm_hit_y_px',
             'sector_8_name', 'sector_4_name', 'sector_2_name'
         ]
@@ -2897,6 +2899,7 @@ def prepare_mra_dataframe(gardiner_local_list, final_cloud, aligned_cloud):
             'anatomical_angle_deg': anat,
             'r_mm': float(item.get('r_mm', np.nan)),
             'bottom_len_mm': float(item.get('bottom_len_mm', np.nan)),
+            'phi_signed_deg': float(item.get('phi_signed_deg', np.nan)),
             'mra_phi_deg': float(item.get('mra_phi_deg', np.nan)),
             'rw_phi_um': float(item.get('rw_phi_um', np.nan)),
             'top_len_mm': float(item.get('top_len_mm', np.nan)),
@@ -2913,7 +2916,7 @@ def prepare_mra_dataframe(gardiner_local_list, final_cloud, aligned_cloud):
     df = pd.DataFrame(rows)
     cols = [
         'slice_id', 'side', 'scan_angle_deg', 'anatomical_angle_deg', 'r_mm',
-        'bottom_len_mm', 'mra_phi_deg', 'rw_phi_um', 'top_len_mm', 'local_area_mm2',
+        'bottom_len_mm', 'phi_signed_deg', 'mra_phi_deg', 'rw_phi_um', 'top_len_mm', 'local_area_mm2',
         'bmo_x_px', 'bmo_y_px', 'ilm_hit_x_px', 'ilm_hit_y_px',
         'sector_8_name', 'sector_4_name', 'sector_2_name'
     ]
@@ -3021,9 +3024,9 @@ def prepare_lcd_lcci_dataframe(lcd_lcci_df, payload_map, final_cloud, aligned_cl
 def build_sector_summary_from_tables(mrw_df, mra_df, lcd_lcci_df):
     rows = []
     specs = [
-        ('MRW_24', mrw_df, [('mrw_len_um', 'MRW_um')]),
-        ('MRA_24', mra_df, [('local_area_mm2', 'MRA_local_area_mm2')]),
-        ('LCD_LCCI_12', lcd_lcci_df, [
+        ('MRW_detail', mrw_df, [('mrw_len_um', 'MRW_um')]),
+        ('MRA_detail', mra_df, [('local_area_mm2', 'MRA_local_area_mm2')]),
+        ('LCD_LCCI_detail', lcd_lcci_df, [
             ('lcd_area_mm', 'LCD_area_mm'),
             ('lcd_direct_mm', 'LCD_direct_mm'),
             ('lcci_area_mm', 'LCCI_area_mm'),
@@ -3065,11 +3068,12 @@ def build_sector_summary_from_tables(mrw_df, mra_df, lcd_lcci_df):
                         'count': int(vals.shape[0]),
                     })
 
-    return pd.DataFrame(rows)
+    cols = ['source_table', 'level', 'sector_name', 'metric_name', 'mean_value', 'count']
+    return pd.DataFrame(rows, columns=cols)
 
 
 def read_patient_baseline(excel_path, patient_id, laterality=None):
-    out = {'axial_length': np.nan, 'laterality': None}
+    out = {}
     try:
         df = pd.read_excel(excel_path)
         if 'Patient_ID' not in df.columns:
@@ -3079,16 +3083,212 @@ def read_patient_baseline(excel_path, patient_id, laterality=None):
             row = row[row['Laterality'].astype(str).str.strip().str.upper() == str(laterality).strip().upper()]
         if row.empty:
             return out
-        if 'Axial_Length' in row.columns:
-            out['axial_length'] = float(row.iloc[0]['Axial_Length'])
-        if 'Laterality' in row.columns:
-            out['laterality'] = str(row.iloc[0]['Laterality']).strip().upper()
+        out = row.iloc[0].to_dict()
+        if 'Patient_ID' in out:
+            out['Patient_ID'] = str(out['Patient_ID'])
+        if 'Laterality' in out and pd.notna(out['Laterality']):
+            out['Laterality'] = str(out['Laterality']).strip().upper()
+        if laterality is not None and 'Laterality' in out:
+            out['Laterality'] = str(laterality).strip().upper()
+        if 'Axial_Length' in out and pd.notna(out['Axial_Length']):
+            out['Axial_Length'] = float(out['Axial_Length'])
     except Exception:
         return out
     return out
 
 
-def export_results_excel(workbook_path, run_summary_df, self_check_df, mrw_df, mra_df, lcd_lcci_df, sector_df):
+def slugify_sector_label(label):
+    txt = unicodedata.normalize('NFKD', str(label)).encode('ascii', 'ignore').decode('ascii')
+    txt = txt.lower()
+    txt = re.sub(r'[^a-z0-9]+', '_', txt)
+    txt = re.sub(r'_+', '_', txt).strip('_')
+    return txt or 'unknown_sector'
+
+
+def summarize_review_status(slice_meta):
+    statuses = []
+    for item in slice_meta.values():
+        status = item.get('review_status')
+        if status is None:
+            continue
+        status_txt = str(status).strip()
+        if status_txt:
+            statuses.append(status_txt)
+    if not statuses:
+        return np.nan
+    unique = sorted(set(statuses))
+    if len(unique) == 1:
+        return unique[0]
+    return '|'.join(unique)
+
+
+def summarize_lcd_lcci_pass_metrics(lcd_lcci_df):
+    if lcd_lcci_df is None or len(lcd_lcci_df) == 0 or 'status' not in lcd_lcci_df.columns:
+        empty = pd.DataFrame(columns=lcd_lcci_df.columns if lcd_lcci_df is not None else [])
+        return {
+            'pass_df': empty,
+            'pass_slices': 0,
+            'total_slices': int(len(lcd_lcci_df)) if lcd_lcci_df is not None else 0,
+            'pass_available': False,
+            'lcd_area_mean': np.nan,
+            'lcci_area_mean': np.nan,
+            'lcd_direct_mean': np.nan,
+            'lcci_direct_mean': np.nan,
+            'alcci_area_mean': np.nan,
+            'alcci_direct_mean': np.nan,
+        }
+
+    pass_df = lcd_lcci_df[lcd_lcci_df['status'].astype(str) == 'PASS'].copy()
+
+    def metric_mean(df, col):
+        if col not in df.columns or len(df) == 0:
+            return np.nan
+        vals = pd.to_numeric(df[col], errors='coerce').dropna()
+        if len(vals) == 0:
+            return np.nan
+        return float(vals.mean())
+
+    return {
+        'pass_df': pass_df,
+        'pass_slices': int(len(pass_df)),
+        'total_slices': int(len(lcd_lcci_df)),
+        'pass_available': bool(len(pass_df) > 0),
+        'lcd_area_mean': metric_mean(pass_df, 'lcd_area_mm'),
+        'lcci_area_mean': metric_mean(pass_df, 'lcci_area_mm'),
+        'lcd_direct_mean': metric_mean(pass_df, 'lcd_direct_mm'),
+        'lcci_direct_mean': metric_mean(pass_df, 'lcci_direct_mm'),
+        'alcci_area_mean': metric_mean(pass_df, 'alcci_area_percent'),
+        'alcci_direct_mean': metric_mean(pass_df, 'alcci_direct_percent'),
+    }
+
+
+def build_master_sector_columns(sector_df):
+    if sector_df is None or len(sector_df) == 0:
+        return {}
+
+    master_sector_values = {}
+    specs = [
+        ('MRW_detail', 'MRW_um', 'MRW', 'um'),
+        ('MRA_detail', 'MRA_local_area_mm2', 'MRA', 'mm2'),
+    ]
+    level_order = ['sector_8', 'sector_4', 'sector_2']
+
+    for source_table, metric_name, prefix, unit in specs:
+        scope = sector_df[
+            (sector_df['source_table'] == source_table) &
+            (sector_df['metric_name'] == metric_name)
+        ].copy()
+        if len(scope) == 0:
+            continue
+
+        scope['sector_key'] = scope['sector_name'].map(slugify_sector_label)
+        for level in level_order:
+            level_rows = scope[scope['level'] == level].sort_values(['sector_key', 'sector_name'])
+            for _, row in level_rows.iterrows():
+                col = f'{prefix}_{level}_{row["sector_key"]}_{unit}'
+                master_sector_values[col] = float(row['mean_value'])
+
+    return master_sector_values
+
+
+def build_master_table(
+    case_id,
+    patient_id,
+    laterality,
+    axial_length,
+    baseline_row,
+    stage2_schema_version,
+    z_stabilization_status,
+    self_check_df,
+    final_cloud,
+    mrw_df,
+    global_mra_mm2,
+    lcd_lcci_df,
+    sector_df,
+):
+    # Master_Table is the canonical source of truth for this output layer.
+    baseline_row = baseline_row or {}
+    slice_meta = final_cloud.get('SLICE_META', {}) if final_cloud is not None else {}
+    expected_slice_count = 12
+    fail_count = 0
+    if self_check_df is not None and 'Status' in self_check_df.columns:
+        fail_count = int((self_check_df['Status'].astype(str) == 'FAIL').sum())
+
+    mrw_global_mean = np.nan
+    if mrw_df is not None and 'mrw_len_um' in mrw_df.columns and len(mrw_df) > 0:
+        vals = pd.to_numeric(mrw_df['mrw_len_um'], errors='coerce').dropna()
+        if len(vals) > 0:
+            mrw_global_mean = float(vals.mean())
+
+    pass_metrics = summarize_lcd_lcci_pass_metrics(lcd_lcci_df)
+
+    row = {
+        'case_id': case_id,
+        'patient_id': patient_id,
+        'laterality': laterality,
+        'axial_length': float(axial_length) if axial_length is not None and np.isfinite(axial_length) else np.nan,
+    }
+
+    for key, value in baseline_row.items():
+        if key in {'Patient_ID', 'Laterality', 'Axial_Length'}:
+            continue
+        row[key] = value
+
+    row.update({
+        'MRW_global_mean': mrw_global_mean,
+        'MRA_global_mm2': float(global_mra_mm2) if global_mra_mm2 is not None and np.isfinite(global_mra_mm2) else np.nan,
+        # Area-based LCD/LCCI globals are canonical in Master_Table for this pass.
+        'LCD_global_mean': pass_metrics['lcd_area_mean'],
+        'LCCI_global_mean': pass_metrics['lcci_area_mean'],
+    })
+
+    row.update(build_master_sector_columns(sector_df))
+
+    row.update({
+        'review_status_summary': summarize_review_status(slice_meta),
+        'slice_count': int(len(slice_meta)),
+        'expected_slice_count': int(expected_slice_count),
+        'slice_count_complete': bool(len(slice_meta) == expected_slice_count),
+        'stage2_schema_version': stage2_schema_version if stage2_schema_version is not None else np.nan,
+        'z_stabilization_status': z_stabilization_status,
+        'self_check_fail_count': int(fail_count),
+        'lcd_lcci_pass_slices': int(pass_metrics['pass_slices']),
+        'lcd_lcci_total_slices': int(pass_metrics['total_slices']),
+        'lcd_lcci_pass_available': bool(pass_metrics['pass_available']),
+    })
+
+    return pd.DataFrame([row])
+
+
+def build_run_summary_df(master_df, lcd_lcci_df, workbook_path, qc_slice_dir, timestamp=None):
+    # Run_Summary is a narrow downstream compatibility sheet only.
+    master_row = master_df.iloc[0].to_dict() if master_df is not None and len(master_df) > 0 else {}
+    pass_metrics = summarize_lcd_lcci_pass_metrics(lcd_lcci_df)
+    out = {
+        'timestamp': timestamp or datetime.now().isoformat(timespec='seconds'),
+        'case_id': master_row.get('case_id'),
+        'patient_id': master_row.get('patient_id'),
+        'laterality': master_row.get('laterality'),
+        'axial_length': master_row.get('axial_length'),
+        'z_stabilization_status': master_row.get('z_stabilization_status'),
+        'mean_mrw_um': master_row.get('MRW_global_mean'),
+        'global_mra_mm2': master_row.get('MRA_global_mm2'),
+        'mean_lcd_area_mm': master_row.get('LCD_global_mean'),
+        'mean_lcci_area_mm': master_row.get('LCCI_global_mean'),
+        'LCD_direct_global_mean': pass_metrics['lcd_direct_mean'],
+        'LCCI_direct_global_mean': pass_metrics['lcci_direct_mean'],
+        'mean_alcci_area_percent': pass_metrics['alcci_area_mean'],
+        'mean_alcci_direct_percent': pass_metrics['alcci_direct_mean'],
+        'lcd_lcci_source': 'per-slice fitted ALCS arc',
+        'lcd_lcci_pass_slices': master_row.get('lcd_lcci_pass_slices'),
+        'lcd_lcci_total_slices': master_row.get('lcd_lcci_total_slices'),
+        'excel_output': workbook_path,
+        'qc_slice_dir': qc_slice_dir,
+    }
+    return pd.DataFrame([out])
+
+
+def export_results_excel(workbook_path, master_df, run_summary_df, self_check_df, mrw_df, mra_df, lcd_lcci_df, sector_df):
     sc = self_check_df.rename(columns={'Check': 'item', 'Status': 'status', 'Detail': 'detail'}).copy()
     for col in ['item', 'status', 'detail']:
         if col not in sc.columns:
@@ -3096,11 +3296,12 @@ def export_results_excel(workbook_path, run_summary_df, self_check_df, mrw_df, m
     sc = sc[['item', 'status', 'detail']]
 
     with pd.ExcelWriter(workbook_path, engine='openpyxl') as writer:
+        master_df.to_excel(writer, sheet_name='Master_Table', index=False)
         run_summary_df.to_excel(writer, sheet_name='Run_Summary', index=False)
         sc.to_excel(writer, sheet_name='Self_Check', index=False)
-        mrw_df.to_excel(writer, sheet_name='MRW_24', index=False)
-        mra_df.to_excel(writer, sheet_name='MRA_24', index=False)
-        lcd_lcci_df.to_excel(writer, sheet_name='LCD_LCCI_12', index=False)
+        mrw_df.to_excel(writer, sheet_name='MRW_detail', index=False)
+        mra_df.to_excel(writer, sheet_name='MRA_detail', index=False)
+        lcd_lcci_df.to_excel(writer, sheet_name='LCD_LCCI_detail', index=False)
         sector_df.to_excel(writer, sheet_name='Sector_Summary', index=False)
 
 
@@ -3126,11 +3327,12 @@ def main(argv=None):
     qc_slice_dir = os.path.join(output_dir, 'QC_Slices')
 
     self_check_df = pd.DataFrame()
-    baseline_info = {'axial_length': np.nan, 'laterality': None}
+    baseline_row = {}
     final_cloud = None
     mrw_segments_list = []
     run_case_id = args.case_id or args.patient_id or 'stage3_case'
     current_patient = args.patient_id or args.case_id or 'unknown_patient'
+    stage2_schema_version = np.nan
 
     if args.input_mode == 'stage2':
         required_args = {
@@ -3179,11 +3381,8 @@ def main(argv=None):
         shared_case = build_stage3_shared_structure(stage2_case, baseline_row)
         final_cloud = build_legacy_cloud_from_shared(shared_case)
         mrw_segments_list = extract_mrw_segments_from_cloud(final_cloud)
+        stage2_schema_version = stage2_case.get('stage2_schema_version', np.nan)
 
-        baseline_info = {
-            'axial_length': float(baseline_row['Axial_Length']),
-            'laterality': str(baseline_row['Laterality']).strip().upper(),
-        }
         current_patient = str(stage2_case['patient_id'])
         run_case_id = str(stage2_case['case_id'])
     else:
@@ -3260,7 +3459,11 @@ def main(argv=None):
             print("final_cloud generation failed. abort")
             return None
         final_cloud, mrw_segments_list = ret
-        baseline_info = read_patient_baseline(my_excel, current_patient, args.laterality)
+        baseline_row = read_patient_baseline(
+            my_excel,
+            current_patient,
+            final_cloud.get('laterality') or args.laterality,
+        )
         run_case_id = args.case_id or current_patient
 
     print("\nSelf-check passed. Continue to full pipeline...")
@@ -3308,43 +3511,38 @@ def main(argv=None):
     save_slice_qc_figures(payload_map, mrw_segments_list, gardiner_local_list, qc_slice_dir, final_cloud, aligned_cloud)
 
     # 8) Export one final Excel workbook
-    laterality = aligned_cloud.get('laterality') or baseline_info.get('laterality')
+    laterality = aligned_cloud.get('laterality') or baseline_row.get('Laterality')
     axial_length = aligned_cloud.get('axial_length')
     if axial_length is None or not np.isfinite(axial_length):
-        axial_length = baseline_info.get('axial_length')
+        axial_length = baseline_row.get('Axial_Length')
     z_status = aligned_cloud.get('z_stabilization_status', 'unknown')
 
-    pass_mask = lcd_lcci_df['status'] == 'PASS' if 'status' in lcd_lcci_df.columns else pd.Series(dtype=bool)
-    lcd_pass = lcd_lcci_df[pass_mask] if len(lcd_lcci_df) > 0 and len(pass_mask) == len(lcd_lcci_df) else lcd_lcci_df
-
     workbook_path = os.path.join(output_dir, f"Final_Results_{run_case_id}.xlsx")
-
-    run_summary_df = pd.DataFrame([
-        {
-            'timestamp': datetime.now().isoformat(timespec='seconds'),
-            'case_id': run_case_id,
-            'patient_id': current_patient,
-            'laterality': laterality,
-            'axial_length': float(axial_length) if axial_length is not None and np.isfinite(axial_length) else np.nan,
-            'z_stabilization_status': z_status,
-            'mean_mrw_um': float(real_mean_mrw),
-            'global_mra_mm2': float(global_mra_mm2),
-            'mean_lcd_area_mm': float(lcd_pass['lcd_area_mm'].mean()) if 'lcd_area_mm' in lcd_pass.columns and len(lcd_pass) > 0 else np.nan,
-            'mean_lcd_direct_mm': float(lcd_pass['lcd_direct_mm'].mean()) if 'lcd_direct_mm' in lcd_pass.columns and len(lcd_pass) > 0 else np.nan,
-            'mean_lcci_area_mm': float(lcd_pass['lcci_area_mm'].mean()) if 'lcci_area_mm' in lcd_pass.columns and len(lcd_pass) > 0 else np.nan,
-            'mean_lcci_direct_mm': float(lcd_pass['lcci_direct_mm'].mean()) if 'lcci_direct_mm' in lcd_pass.columns and len(lcd_pass) > 0 else np.nan,
-            'mean_alcci_area_percent': float(lcd_pass['alcci_area_percent'].mean()) if 'alcci_area_percent' in lcd_pass.columns and len(lcd_pass) > 0 else np.nan,
-            'mean_alcci_direct_percent': float(lcd_pass['alcci_direct_percent'].mean()) if 'alcci_direct_percent' in lcd_pass.columns and len(lcd_pass) > 0 else np.nan,
-            'lcd_lcci_source': 'per-slice fitted ALCS arc',
-            'lcd_lcci_pass_slices': int((lcd_lcci_df['status'] == 'PASS').sum()) if 'status' in lcd_lcci_df.columns else 0,
-            'lcd_lcci_total_slices': int(len(lcd_lcci_df)),
-            'excel_output': workbook_path,
-            'qc_slice_dir': qc_slice_dir,
-        }
-    ])
+    master_df = build_master_table(
+        case_id=run_case_id,
+        patient_id=current_patient,
+        laterality=laterality,
+        axial_length=axial_length,
+        baseline_row=baseline_row,
+        stage2_schema_version=stage2_schema_version,
+        z_stabilization_status=z_status,
+        self_check_df=self_check_df,
+        final_cloud=final_cloud,
+        mrw_df=mrw_df,
+        global_mra_mm2=global_mra_mm2,
+        lcd_lcci_df=lcd_lcci_df,
+        sector_df=sector_df,
+    )
+    run_summary_df = build_run_summary_df(
+        master_df,
+        lcd_lcci_df,
+        workbook_path=workbook_path,
+        qc_slice_dir=qc_slice_dir,
+    )
 
     export_results_excel(
         workbook_path,
+        master_df,
         run_summary_df,
         self_check_df,
         mrw_df,
