@@ -1,7 +1,9 @@
 import importlib.util
+import io
 import shutil
 import unittest
 import uuid
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
@@ -51,67 +53,85 @@ class Stage3ReportOutputTests(unittest.TestCase):
             "CCT": 525,
         }
 
-    def build_sector_df(self):
-        return pd.DataFrame(
-            [
-                {
-                    "source_table": "MRW_detail",
-                    "level": "sector_8",
-                    "sector_name": "Alpha (One)/Two",
-                    "metric_name": "MRW_um",
-                    "mean_value": 11.0,
-                    "count": 2,
-                },
-                {
-                    "source_table": "MRW_detail",
-                    "level": "sector_4",
-                    "sector_name": "Beta / Three",
-                    "metric_name": "MRW_um",
-                    "mean_value": 12.0,
-                    "count": 2,
-                },
-                {
-                    "source_table": "MRW_detail",
-                    "level": "sector_2",
-                    "sector_name": "Gamma (Four)",
-                    "metric_name": "MRW_um",
-                    "mean_value": 13.0,
-                    "count": 2,
-                },
-                {
-                    "source_table": "MRA_detail",
-                    "level": "sector_8",
-                    "sector_name": "Delta / Five",
-                    "metric_name": "MRA_local_area_mm2",
-                    "mean_value": 1.1,
-                    "count": 2,
-                },
-                {
-                    "source_table": "MRA_detail",
-                    "level": "sector_4",
-                    "sector_name": "Epsilon (Six)",
-                    "metric_name": "MRA_local_area_mm2",
-                    "mean_value": 1.2,
-                    "count": 2,
-                },
-                {
-                    "source_table": "MRA_detail",
-                    "level": "sector_2",
-                    "sector_name": "Zeta / Seven",
-                    "metric_name": "MRA_local_area_mm2",
-                    "mean_value": 1.3,
-                    "count": 2,
-                },
+    def build_sector_df(
+        self,
+        *,
+        include_mrw=True,
+        include_mra=True,
+        include_lcd=True,
+        include_unexpected=False,
+    ):
+        schema = self.module.get_expected_master_sector_schema()
+        labels_by_level = schema["labels_by_level"]
+        rows = []
+
+        if include_mrw:
+            value = 10.0
+            for level in ["sector_8", "sector_4", "sector_2"]:
+                for sector_name in labels_by_level[level]:
+                    rows.append(
+                        {
+                            "source_table": "MRW_detail",
+                            "level": level,
+                            "sector_name": sector_name,
+                            "metric_name": "MRW_um",
+                            "mean_value": value,
+                            "count": 2,
+                        }
+                    )
+                    value += 1.0
+
+        if include_mra:
+            value = 1.0
+            for level in ["sector_8", "sector_4", "sector_2"]:
+                for sector_name in labels_by_level[level]:
+                    rows.append(
+                        {
+                            "source_table": "MRA_detail",
+                            "level": level,
+                            "sector_name": sector_name,
+                            "metric_name": "MRA_local_area_mm2",
+                            "mean_value": value,
+                            "count": 2,
+                        }
+                    )
+                    value += 0.1
+
+        if include_lcd:
+            rows.append(
                 {
                     "source_table": "LCD_LCCI_detail",
                     "level": "sector_8",
-                    "sector_name": "Ignored / Eight",
+                    "sector_name": labels_by_level["sector_8"][0],
                     "metric_name": "LCD_area_mm",
                     "mean_value": 2.2,
                     "count": 2,
-                },
-            ]
-        )
+                }
+            )
+
+        if include_unexpected:
+            rows.extend(
+                [
+                    {
+                        "source_table": "MRW_detail",
+                        "level": "sector_99",
+                        "sector_name": "Bogus Sector",
+                        "metric_name": "MRW_um",
+                        "mean_value": 999.0,
+                        "count": 1,
+                    },
+                    {
+                        "source_table": "MRA_detail",
+                        "level": "sector_8",
+                        "sector_name": "Bogus Sector",
+                        "metric_name": "MRA_local_area_mm2",
+                        "mean_value": 999.0,
+                        "count": 1,
+                    },
+                ]
+            )
+
+        return pd.DataFrame(rows)
 
     def build_master_inputs(self):
         baseline_row = self.build_baseline_row()
@@ -164,6 +184,7 @@ class Stage3ReportOutputTests(unittest.TestCase):
 
     def test_master_table_structure_and_sector_order(self):
         baseline_row, mrw_df, lcd_lcci_df, sector_df, self_check_df, final_cloud = self.build_master_inputs()
+        expected_sector_columns = self.module.get_expected_master_sector_schema()["ordered_columns"]
 
         master_df = self.module.build_master_table(
             case_id="CASE-001",
@@ -181,6 +202,7 @@ class Stage3ReportOutputTests(unittest.TestCase):
             sector_df=sector_df,
         )
 
+        self.assertEqual(len(master_df), 1)
         columns = list(master_df.columns)
         self.assertEqual(columns[:4], ["case_id", "patient_id", "laterality", "axial_length"])
         self.assertEqual(
@@ -198,17 +220,7 @@ class Stage3ReportOutputTests(unittest.TestCase):
         self.assertEqual(row["LCCI_global_mean"], 3.0)
 
         sector_columns = [col for col in columns if col.startswith("MRW_sector_") or col.startswith("MRA_sector_")]
-        self.assertEqual(
-            sector_columns,
-            [
-                "MRW_sector_8_alpha_one_two_um",
-                "MRW_sector_4_beta_three_um",
-                "MRW_sector_2_gamma_four_um",
-                "MRA_sector_8_delta_five_mm2",
-                "MRA_sector_4_epsilon_six_mm2",
-                "MRA_sector_2_zeta_seven_mm2",
-            ],
-        )
+        self.assertEqual(sector_columns, expected_sector_columns)
         self.assertFalse(any(col.startswith("LCD_sector_") or col.startswith("LCCI_sector_") for col in columns))
 
     def test_master_table_uses_pass_slice_area_only_for_lcd_lcci_globals(self):
@@ -237,6 +249,92 @@ class Stage3ReportOutputTests(unittest.TestCase):
         self.assertTrue(row["lcd_lcci_pass_available"])
         self.assertNotIn("LCD_direct_global_mean", master_df.columns)
         self.assertNotIn("LCCI_direct_global_mean", master_df.columns)
+
+    def test_master_table_has_fixed_sector_schema_when_sector_df_empty(self):
+        baseline_row, mrw_df, lcd_lcci_df, _, self_check_df, final_cloud = self.build_master_inputs()
+        expected_sector_columns = self.module.get_expected_master_sector_schema()["ordered_columns"]
+        master_df = self.module.build_master_table(
+            case_id="CASE-EMPTY",
+            patient_id="P001",
+            laterality="R",
+            axial_length=24.5,
+            baseline_row=baseline_row,
+            stage2_schema_version="v1",
+            z_stabilization_status="stable",
+            self_check_df=self_check_df,
+            final_cloud=final_cloud,
+            mrw_df=mrw_df,
+            global_mra_mm2=9.5,
+            lcd_lcci_df=lcd_lcci_df,
+            sector_df=pd.DataFrame(columns=["source_table", "level", "sector_name", "metric_name", "mean_value", "count"]),
+        )
+
+        self.assertEqual(len(master_df), 1)
+        for col in expected_sector_columns:
+            self.assertIn(col, master_df.columns)
+            self.assertTrue(pd.isna(master_df.iloc[0][col]))
+            self.assertFalse(isinstance(master_df.iloc[0][col], str))
+        self.assertFalse(any(col.startswith("LCD_sector_") or col.startswith("LCCI_sector_") for col in master_df.columns))
+
+    def test_master_table_keeps_full_mra_schema_when_only_mrw_rows_exist(self):
+        baseline_row, mrw_df, lcd_lcci_df, _, self_check_df, final_cloud = self.build_master_inputs()
+        expected_sector_columns = self.module.get_expected_master_sector_schema()["ordered_columns"]
+        sector_df = self.build_sector_df(include_mrw=True, include_mra=False, include_lcd=False)
+
+        master_df = self.module.build_master_table(
+            case_id="CASE-MRW",
+            patient_id="P001",
+            laterality="R",
+            axial_length=24.5,
+            baseline_row=baseline_row,
+            stage2_schema_version="v1",
+            z_stabilization_status="stable",
+            self_check_df=self_check_df,
+            final_cloud=final_cloud,
+            mrw_df=mrw_df,
+            global_mra_mm2=9.5,
+            lcd_lcci_df=lcd_lcci_df,
+            sector_df=sector_df,
+        )
+
+        mra_columns = [col for col in expected_sector_columns if col.startswith("MRA_")]
+        mrw_columns = [col for col in expected_sector_columns if col.startswith("MRW_")]
+        for col in mrw_columns:
+            self.assertIn(col, master_df.columns)
+            self.assertTrue(pd.notna(master_df.iloc[0][col]))
+        for col in mra_columns:
+            self.assertIn(col, master_df.columns)
+            self.assertTrue(pd.isna(master_df.iloc[0][col]))
+
+    def test_master_table_keeps_full_mrw_schema_when_only_mra_rows_exist(self):
+        baseline_row, mrw_df, lcd_lcci_df, _, self_check_df, final_cloud = self.build_master_inputs()
+        expected_sector_columns = self.module.get_expected_master_sector_schema()["ordered_columns"]
+        sector_df = self.build_sector_df(include_mrw=False, include_mra=True, include_lcd=False)
+
+        master_df = self.module.build_master_table(
+            case_id="CASE-MRA",
+            patient_id="P001",
+            laterality="R",
+            axial_length=24.5,
+            baseline_row=baseline_row,
+            stage2_schema_version="v1",
+            z_stabilization_status="stable",
+            self_check_df=self_check_df,
+            final_cloud=final_cloud,
+            mrw_df=mrw_df,
+            global_mra_mm2=9.5,
+            lcd_lcci_df=lcd_lcci_df,
+            sector_df=sector_df,
+        )
+
+        mra_columns = [col for col in expected_sector_columns if col.startswith("MRA_")]
+        mrw_columns = [col for col in expected_sector_columns if col.startswith("MRW_")]
+        for col in mra_columns:
+            self.assertIn(col, master_df.columns)
+            self.assertTrue(pd.notna(master_df.iloc[0][col]))
+        for col in mrw_columns:
+            self.assertIn(col, master_df.columns)
+            self.assertTrue(pd.isna(master_df.iloc[0][col]))
 
     def test_master_table_no_pass_slices_emits_nan_and_status_flag(self):
         baseline_row, mrw_df, _, sector_df, self_check_df, final_cloud = self.build_master_inputs()
@@ -343,6 +441,39 @@ class Stage3ReportOutputTests(unittest.TestCase):
             set(sector_df["source_table"]),
             {"MRW_detail", "MRA_detail", "LCD_LCCI_detail"},
         )
+
+    def test_unexpected_sector_rows_do_not_create_dynamic_master_columns(self):
+        baseline_row, mrw_df, lcd_lcci_df, _, self_check_df, final_cloud = self.build_master_inputs()
+        expected_sector_columns = self.module.get_expected_master_sector_schema()["ordered_columns"]
+        sector_df = self.build_sector_df(
+            include_mrw=False,
+            include_mra=False,
+            include_lcd=False,
+            include_unexpected=True,
+        )
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            master_df = self.module.build_master_table(
+                case_id="CASE-BOGUS",
+                patient_id="P001",
+                laterality="R",
+                axial_length=24.5,
+                baseline_row=baseline_row,
+                stage2_schema_version="v1",
+                z_stabilization_status="stable",
+                self_check_df=self_check_df,
+                final_cloud=final_cloud,
+                mrw_df=mrw_df,
+                global_mra_mm2=9.5,
+                lcd_lcci_df=lcd_lcci_df,
+                sector_df=sector_df,
+            )
+
+        self.assertIn("ignoring unexpected sector row", buffer.getvalue())
+        sector_columns = [col for col in master_df.columns if col.startswith("MRW_sector_") or col.startswith("MRA_sector_")]
+        self.assertEqual(sector_columns, expected_sector_columns)
+        self.assertFalse(any("bogus" in col for col in sector_columns))
 
     def test_run_summary_is_narrow_and_derived_from_master(self):
         baseline_row, mrw_df, lcd_lcci_df, sector_df, self_check_df, final_cloud = self.build_master_inputs()

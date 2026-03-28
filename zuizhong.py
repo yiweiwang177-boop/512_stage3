@@ -3105,6 +3105,48 @@ def slugify_sector_label(label):
     return txt or 'unknown_sector'
 
 
+def _ordered_unique_non_null(values):
+    out = []
+    seen = set()
+    for value in values:
+        if value is None:
+            continue
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def get_expected_master_sector_schema():
+    sector_8_labels = [name for _, _, name in SECTOR_8_BOUNDS]
+    sector_4_labels = _ordered_unique_non_null(SECTOR_4_MAP.get(name) for name in sector_8_labels)
+    sector_2_labels = _ordered_unique_non_null(SECTOR_2_MAP.get(name) for name in sector_8_labels)
+    labels_by_level = {
+        'sector_8': sector_8_labels,
+        'sector_4': sector_4_labels,
+        'sector_2': sector_2_labels,
+    }
+
+    ordered_columns = []
+    column_map = {}
+    specs = [
+        ('MRW_detail', 'MRW_um', 'MRW', 'um'),
+        ('MRA_detail', 'MRA_local_area_mm2', 'MRA', 'mm2'),
+    ]
+    for source_table, metric_name, prefix, unit in specs:
+        for level in ['sector_8', 'sector_4', 'sector_2']:
+            for sector_name in labels_by_level[level]:
+                col = f'{prefix}_{level}_{slugify_sector_label(sector_name)}_{unit}'
+                ordered_columns.append(col)
+                column_map[(source_table, metric_name, level, sector_name)] = col
+
+    return {
+        'labels_by_level': labels_by_level,
+        'ordered_columns': ordered_columns,
+        'column_map': column_map,
+    }
+
+
 def summarize_review_status(slice_meta):
     statuses = []
     for item in slice_meta.values():
@@ -3163,30 +3205,30 @@ def summarize_lcd_lcci_pass_metrics(lcd_lcci_df):
 
 
 def build_master_sector_columns(sector_df):
+    schema = get_expected_master_sector_schema()
+    master_sector_values = {col: np.nan for col in schema['ordered_columns']}
     if sector_df is None or len(sector_df) == 0:
-        return {}
+        return master_sector_values
 
-    master_sector_values = {}
-    specs = [
-        ('MRW_detail', 'MRW_um', 'MRW', 'um'),
-        ('MRA_detail', 'MRA_local_area_mm2', 'MRA', 'mm2'),
-    ]
-    level_order = ['sector_8', 'sector_4', 'sector_2']
+    for _, row in sector_df.iterrows():
+        source_table = row.get('source_table')
+        metric_name = row.get('metric_name')
+        level = row.get('level')
+        sector_name = row.get('sector_name')
 
-    for source_table, metric_name, prefix, unit in specs:
-        scope = sector_df[
-            (sector_df['source_table'] == source_table) &
-            (sector_df['metric_name'] == metric_name)
-        ].copy()
-        if len(scope) == 0:
+        if source_table not in {'MRW_detail', 'MRA_detail'}:
             continue
 
-        scope['sector_key'] = scope['sector_name'].map(slugify_sector_label)
-        for level in level_order:
-            level_rows = scope[scope['level'] == level].sort_values(['sector_key', 'sector_name'])
-            for _, row in level_rows.iterrows():
-                col = f'{prefix}_{level}_{row["sector_key"]}_{unit}'
-                master_sector_values[col] = float(row['mean_value'])
+        col = schema['column_map'].get((source_table, metric_name, level, sector_name))
+        if col is None:
+            print(
+                f"[Master_Table] ignoring unexpected sector row: "
+                f"source={source_table}, metric={metric_name}, level={level}, sector={sector_name}"
+            )
+            continue
+
+        mean_value = pd.to_numeric(pd.Series([row.get('mean_value')]), errors='coerce').iloc[0]
+        master_sector_values[col] = float(mean_value) if pd.notna(mean_value) else np.nan
 
     return master_sector_values
 
