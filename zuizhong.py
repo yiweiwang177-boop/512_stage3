@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import math
@@ -17,6 +18,19 @@ from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
 from matplotlib.path import Path
 from scipy.interpolate import splprep, splev
+
+from stage3_canonical_access import (
+    build_aligned_canonical_slice_geometry,
+    build_ordered_bmo24_from_canonical_slice_geometry,
+    build_unaligned_canonical_slice_geometry,
+    get_shared_case,
+)
+from stage3_input_adapter import (
+    load_patient_baseline_row,
+    load_stage2_case,
+    validate_stage3_input_contract,
+)
+from stage3_shared import build_legacy_cloud_from_shared, build_stage3_shared_structure
 
 try:
     if hasattr(sys.stdout, 'reconfigure'):
@@ -570,6 +584,16 @@ def process_full_eye_to_3d_point_cloud(patient_folder, excel_path, patient_id, j
     return cloud_3d, mrw_segments_list
 
 
+def load_legacy_labelme_case(patient_folder, excel_path, patient_id, json_dir=None, image_dir=None):
+    return process_full_eye_to_3d_point_cloud(
+        patient_folder,
+        excel_path,
+        patient_id,
+        json_dir=json_dir,
+        image_dir=image_dir,
+    )
+
+
 def fit_bmo_bfp_geometry(cloud_3d):
     if cloud_3d is None or 'BMO' not in cloud_3d or len(cloud_3d['BMO']) < 3:
         return None, None
@@ -630,6 +654,7 @@ def align_to_bmo_bfp(cloud_3d):
         'laterality': cloud_3d.get('laterality', 'R'),
         'axial_length': cloud_3d.get('axial_length', np.nan),
         'z_stabilization_status': cloud_3d.get('z_stabilization_status', 'unknown'),
+        'shared_case': cloud_3d.get('shared_case'),
         'ALIGNMENT': {
             'centroid': tuple(np.asarray(centroid, dtype=float).tolist()),
             'rotation_matrix': rotation.as_matrix().tolist(),
@@ -855,6 +880,83 @@ def build_slice_ilm_segment_dict(ilm_meta):
     return out
 
 
+def extract_mrw_segments_from_cloud(cloud_3d):
+    """Extract MRW segments with canonical shared data as the primary path.
+
+    This pass keeps the MRW formula unchanged. When `shared_case` is present,
+    MRW reads canonical BMO/full-ILM data first; compat meta is only a
+    temporary fallback for legacy mode or not-yet-migrated outputs.
+    """
+    mrw_segments_list = []
+    shared_case = get_shared_case(cloud_3d)
+    if shared_case is not None:
+        canonical_geom = build_unaligned_canonical_slice_geometry(shared_case)
+        bmo_dict = {sid: geom['bmo_lr'] for sid, geom in canonical_geom.items()}
+        ilm_dict = {
+            sid: geom['ilm_lr']
+            for sid, geom in canonical_geom.items()
+            if 'L' in geom['ilm_lr'] and 'R' in geom['ilm_lr']
+        }
+    else:
+        bmo_dict = build_slice_bmo_dict(cloud_3d.get('BMO_META', []))
+        ilm_dict = build_slice_ilm_segment_dict(cloud_3d.get('ILM_META', []))
+
+    for sid in sorted(set(bmo_dict.keys()) & set(ilm_dict.keys())):
+        if 'L' not in bmo_dict[sid] or 'R' not in bmo_dict[sid]:
+            continue
+        if 'L' not in ilm_dict[sid] or 'R' not in ilm_dict[sid]:
+            continue
+
+        left_bmo_pt = np.array(bmo_dict[sid]['L']['point_3d'], dtype=float)
+        right_bmo_pt = np.array(bmo_dict[sid]['R']['point_3d'], dtype=float)
+        bmo_baseline_vec = right_bmo_pt - left_bmo_pt
+
+        left_ilm_polyline = np.array(ilm_dict[sid]['L'], dtype=float)
+        right_ilm_polyline = np.array(ilm_dict[sid]['R'], dtype=float)
+
+        closest_left_ilm_pt, left_dist_mm = closest_point_on_polyline_3d(
+            left_bmo_pt, left_ilm_polyline
+        )
+        if closest_left_ilm_pt is not None:
+            left_dist_um = left_dist_mm * 1000.0
+            if left_dist_um < 800:
+                left_vec = closest_left_ilm_pt - left_bmo_pt
+                left_angle_deg = acute_angle_between_vectors(left_vec, bmo_baseline_vec)
+                abs_angle = anatomical_angle_deg(left_bmo_pt[0], left_bmo_pt[1])
+                mrw_segments_list.append({
+                    'slice_id': sid,
+                    'side': 'L',
+                    'angle': float(abs_angle),
+                    'bmo_pt': tuple(left_bmo_pt.tolist()),
+                    'ilm_pt': tuple(closest_left_ilm_pt.tolist()),
+                    'mrw_vector': tuple(left_vec.tolist()),
+                    'mrw_len': float(left_dist_um),
+                    'mrw_angle_deg': float(left_angle_deg),
+                })
+
+        closest_right_ilm_pt, right_dist_mm = closest_point_on_polyline_3d(
+            right_bmo_pt, right_ilm_polyline
+        )
+        if closest_right_ilm_pt is not None:
+            right_dist_um = right_dist_mm * 1000.0
+            if right_dist_um < 800:
+                right_vec = closest_right_ilm_pt - right_bmo_pt
+                right_angle_deg = acute_angle_between_vectors(right_vec, bmo_baseline_vec)
+                abs_angle = anatomical_angle_deg(right_bmo_pt[0], right_bmo_pt[1])
+                mrw_segments_list.append({
+                    'slice_id': sid,
+                    'side': 'R',
+                    'angle': float(abs_angle),
+                    'bmo_pt': tuple(right_bmo_pt.tolist()),
+                    'ilm_pt': tuple(closest_right_ilm_pt.tolist()),
+                    'mrw_vector': tuple(right_vec.tolist()),
+                    'mrw_len': float(right_dist_um),
+                    'mrw_angle_deg': float(right_angle_deg),
+                })
+
+    return mrw_segments_list
+
+
 def build_ordered_bmo24_from_meta(bmo_meta):
     """
     固定顺序：
@@ -1008,21 +1110,33 @@ def calculate_gardiner_mra(aligned_cloud, n_sectors=24, phi_step_deg=0.5):
         print("  ❌ 错误: aligned_cloud 为 None")
         return [], 0.0
 
-    bmo_meta = aligned_cloud.get('BMO_META', [])
-    ilm_meta = aligned_cloud.get('ILM_META', [])
+    # Canonical shared data is the primary input path in this pass.
+    # Compat meta remains a temporary fallback only; MRA formulas stay unchanged.
+    shared_case = get_shared_case(aligned_cloud)
+    if shared_case is not None and aligned_cloud.get('ALIGNMENT') is not None:
+        canonical_geom = build_aligned_canonical_slice_geometry(shared_case, aligned_cloud['ALIGNMENT'])
+        bmo_dict = {sid: geom['bmo_lr'] for sid, geom in canonical_geom.items()}
+        ilm_dict = {
+            sid: geom['ilm_lr']
+            for sid, geom in canonical_geom.items()
+            if 'L' in geom['ilm_lr'] and 'R' in geom['ilm_lr']
+        }
+        ordered_bmo24 = build_ordered_bmo24_from_canonical_slice_geometry(canonical_geom)
+    else:
+        bmo_meta = aligned_cloud.get('BMO_META', [])
+        ilm_meta = aligned_cloud.get('ILM_META', [])
 
-    if not bmo_meta or not ilm_meta:
-        print("  ❌ 错误: BMO_META 或 ILM_META 为空")
-        return [], 0.0
+        if not bmo_meta or not ilm_meta:
+            print("  ❌ 错误: BMO_META 或 ILM_META 为空")
+            return [], 0.0
 
-    bmo_dict = build_slice_bmo_dict(bmo_meta)
-    ilm_dict = build_slice_ilm_segment_dict(ilm_meta)
+        bmo_dict = build_slice_bmo_dict(bmo_meta)
+        ilm_dict = build_slice_ilm_segment_dict(ilm_meta)
+        ordered_bmo24 = build_ordered_bmo24_from_meta(bmo_meta)
 
     if not bmo_dict or not ilm_dict:
         print("  ❌ 错误: BMO 或 ILM 切片字典构建失败")
         return [], 0.0
-
-    ordered_bmo24 = build_ordered_bmo24_from_meta(bmo_meta)
     if len(ordered_bmo24) < 6:
         print("  ❌ 错误: 有效 BMO 点不足，无法进行 MRA 计算")
         return [], 0.0
@@ -1033,7 +1147,7 @@ def calculate_gardiner_mra(aligned_cloud, n_sectors=24, phi_step_deg=0.5):
 
     index_map = build_bmo24_index_map(ordered_bmo24)
 
-    all_bmo = np.array(aligned_cloud['BMO'], dtype=float)
+    all_bmo = np.array([item['point_3d'] for item in ordered_bmo24], dtype=float)
     center_xy = np.mean(all_bmo[:, :2], axis=0)
 
     gardiner_local_list = []
@@ -1661,7 +1775,7 @@ def check_output_writable(output_dir):
     return ok, records
 
 
-def startup_self_check(config):
+def startup_self_check_legacy(config):
     all_records = []
 
     ok_pkg, rec_pkg = check_required_packages(config.get('excel_path'))
@@ -1694,6 +1808,65 @@ def startup_self_check(config):
     overall_ok = ok_pkg and ok_path and ok_patient and ok_excel and ok_pair and ok_label and ok_out
 
     return overall_ok, self_check_df, path_ctx if ok_path else {}
+
+
+def validate_stage3_stage2_contract(config):
+    all_records = []
+
+    ok_pkg, rec_pkg = check_required_packages(config.get('base_table_path'))
+    all_records.extend(rec_pkg)
+
+    stage2_json = config.get('stage2_json')
+    base_table_path = config.get('base_table_path')
+    output_dir = config.get('output_dir')
+    case_id = config.get('case_id')
+    patient_id = config.get('patient_id')
+    laterality = str(config.get('laterality', '')).strip().upper()
+
+    stage2_exists = bool(stage2_json) and os.path.isfile(stage2_json)
+    base_exists = bool(base_table_path) and os.path.isfile(base_table_path)
+    all_records.extend([
+        {'Check': 'path:stage2_json', 'Status': 'PASS' if stage2_exists else 'FAIL',
+         'Detail': str(stage2_json)},
+        {'Check': 'path:base_table', 'Status': 'PASS' if base_exists else 'FAIL',
+         'Detail': str(base_table_path)},
+    ])
+
+    stage2_case = None
+    baseline_row = None
+    ok_contract = False
+
+    if stage2_exists and base_exists:
+        try:
+            stage2_case = load_stage2_case(stage2_json, expected_case_id=case_id)
+            baseline_row = load_patient_baseline_row(base_table_path, patient_id, laterality)
+            contract_records = validate_stage3_input_contract(stage2_case, baseline_row)
+            all_records.extend(contract_records)
+            ok_contract = all(item['Status'] == 'PASS' for item in contract_records)
+        except Exception as exc:
+            all_records.append({
+                'Check': 'stage2:contract_load',
+                'Status': 'FAIL',
+                'Detail': str(exc),
+            })
+
+    ok_out, rec_out = check_output_writable(output_dir)
+    all_records.extend(rec_out)
+
+    self_check_df = pd.DataFrame(all_records)
+    overall_ok = ok_pkg and stage2_exists and base_exists and ok_contract and ok_out
+    context = {
+        'stage2_case': stage2_case,
+        'baseline_row': baseline_row,
+    } if overall_ok else {}
+    return overall_ok, self_check_df, context
+
+
+def startup_self_check(config):
+    input_mode = str(config.get('input_mode', 'legacy')).strip().lower()
+    if input_mode == 'stage2':
+        return validate_stage3_stage2_contract(config)
+    return startup_self_check_legacy(config)
 
 
 def build_slice_ali_dict(ali_meta):
@@ -1835,6 +2008,18 @@ def aligned_3d_to_original_3d(point_3d, alignment):
     rot = R.from_matrix(np.asarray(alignment['rotation_matrix'], dtype=float))
     cen = np.asarray(alignment['centroid'], dtype=float)
     return rot.inv().apply(pt) + cen
+
+
+def original_3d_to_aligned_3d(point_3d, alignment):
+    if alignment is None:
+        return None
+    if 'rotation_matrix' not in alignment or 'centroid' not in alignment:
+        return None
+
+    pt = np.asarray(point_3d, dtype=float)
+    rot = R.from_matrix(np.asarray(alignment['rotation_matrix'], dtype=float))
+    cen = np.asarray(alignment['centroid'], dtype=float)
+    return rot.apply(pt - cen)
 
 
 def aligned_3d_to_image_px(point_3d, slice_id, aligned_cloud):
@@ -2138,13 +2323,30 @@ def compute_slice_traditional_lcd_lcci(slice_id, bmo_lr, ali_lr, alcs_pts):
 
 
 def compute_traditional_lcd_lcci_all_slices(aligned_cloud):
-    bmo_meta = aligned_cloud.get('BMO_META', [])
-    ali_meta = aligned_cloud.get('ALI_META', [])
-    alcs_meta = aligned_cloud.get('ALCS_META', [])
+    """Compute LCD/LCCI with canonical shared data as the primary input path.
 
-    bmo_dict = build_slice_bmo_dict(bmo_meta)
-    ali_dict = build_slice_ali_dict(ali_meta)
-    alcs_dict = build_slice_alcs_dict(alcs_meta)
+    This pass intentionally keeps the existing formulas unchanged. Canonical
+    cutoff and effective-RNFL data are preferred; compat meta remains only as
+    a temporary fallback for legacy mode or not-yet-migrated outputs.
+    """
+    # Canonical shared data is the primary input path in this pass.
+    # Compat meta remains a temporary fallback only; LCD/LCCI formulas stay unchanged.
+    shared_case = get_shared_case(aligned_cloud)
+    if shared_case is not None and aligned_cloud.get('ALIGNMENT') is not None:
+        canonical_geom = build_aligned_canonical_slice_geometry(shared_case, aligned_cloud['ALIGNMENT'])
+        bmo_dict = {sid: geom['bmo_lr'] for sid, geom in canonical_geom.items()}
+        # Local alias preserved to minimize diff; source of truth is canonical cutoff points.
+        ali_dict = {sid: geom['cutoff_lr'] for sid, geom in canonical_geom.items()}
+        # Local alias preserved to minimize diff; source of truth is canonical effective RNFL lower segment.
+        alcs_dict = {sid: geom['rnfl_effective_seg'] for sid, geom in canonical_geom.items()}
+    else:
+        bmo_meta = aligned_cloud.get('BMO_META', [])
+        ali_meta = aligned_cloud.get('ALI_META', [])
+        alcs_meta = aligned_cloud.get('ALCS_META', [])
+
+        bmo_dict = build_slice_bmo_dict(bmo_meta)
+        ali_dict = build_slice_ali_dict(ali_meta)
+        alcs_dict = build_slice_alcs_dict(alcs_meta)
 
     slice_ids = sorted(set(bmo_dict.keys()) | set(ali_dict.keys()) | set(alcs_dict.keys()))
 
@@ -2765,13 +2967,15 @@ def build_sector_summary_from_tables(mrw_df, mra_df, lcd_lcci_df):
     return pd.DataFrame(rows)
 
 
-def read_patient_baseline(excel_path, patient_id):
+def read_patient_baseline(excel_path, patient_id, laterality=None):
     out = {'axial_length': np.nan, 'laterality': None}
     try:
         df = pd.read_excel(excel_path)
         if 'Patient_ID' not in df.columns:
             return out
         row = df[df['Patient_ID'] == patient_id]
+        if laterality is not None and 'Laterality' in df.columns:
+            row = row[row['Laterality'].astype(str).str.strip().str.upper() == str(laterality).strip().upper()]
         if row.empty:
             return out
         if 'Axial_Length' in row.columns:
@@ -2799,90 +3003,169 @@ def export_results_excel(workbook_path, run_summary_df, self_check_df, mrw_df, m
         sector_df.to_excel(writer, sheet_name='Sector_Summary', index=False)
 
 
-def main():
-    # ================= user config =================
-    my_excel = r"D:/code experiment/pycahrm code/PyCharmMiscProject/data.xls"
-    patient_folder = r"D:/code experiment/pycahrm code/PyCharmMiscProject/xu lingxi"
-    current_patient = "xu lingxi"
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description='Stage3 first-pass refactor entry')
+    parser.add_argument('--input-mode', choices=['stage2', 'legacy'], default='stage2')
+    parser.add_argument('--stage2-json')
+    parser.add_argument('--base-table')
+    parser.add_argument('--case-id')
+    parser.add_argument('--output-dir', default=os.path.join(os.getcwd(), 'Final_Analysis_Output'))
+    parser.add_argument('--patient-id')
+    parser.add_argument('--laterality')
+    parser.add_argument('--legacy-patient-folder')
+    parser.add_argument('--legacy-json-dir')
+    parser.add_argument('--legacy-image-dir')
+    parser.add_argument('--legacy-excel-path')
+    return parser.parse_args(argv)
 
-    # Auto-discover usable local paths inside current project folder.
-    configured_paths = {
-        'excel_path': my_excel,
-        'patient_folder': patient_folder,
-        'patient_id': current_patient,
-    }
-    discovered = auto_discover_paths(os.getcwd(), patient_id_hint=current_patient, excel_hint=my_excel)
 
-    if discovered.get('excel_path'):
-        my_excel = discovered['excel_path']
-    if discovered.get('patient_folder'):
-        patient_folder = discovered['patient_folder']
-    json_dir = discovered.get('json_dir') or os.path.join(patient_folder, 'JSONs')
-    image_dir = discovered.get('image_dir')
-    if not image_dir:
-        image_pick = choose_image_dir(patient_folder, json_dir)
-        image_dir = image_pick['image_dir']
-
-    output_dir = os.path.join(os.getcwd(), 'Final_Analysis_Output')
+def main(argv=None):
+    args = parse_args(argv)
+    output_dir = args.output_dir
     qc_slice_dir = os.path.join(output_dir, 'QC_Slices')
-    workbook_path = os.path.join(output_dir, f"Final_Results_{current_patient}.xlsx")
 
-    print("\n===== PATH CONFIG (configured) =====")
-    print(f"excel_path: {configured_paths['excel_path']}")
-    print(f"patient_folder: {configured_paths['patient_folder']}")
-    print(f"patient_id: {configured_paths['patient_id']}")
+    self_check_df = pd.DataFrame()
+    baseline_info = {'axial_length': np.nan, 'laterality': None}
+    final_cloud = None
+    mrw_segments_list = []
+    run_case_id = args.case_id or args.patient_id or 'stage3_case'
+    current_patient = args.patient_id or args.case_id or 'unknown_patient'
 
-    print("\n===== PATH CONFIG (auto-discovered) =====")
-    print(f"excel_path: {my_excel}")
-    print(f"patient_folder: {patient_folder}")
-    print(f"json_dir: {json_dir}")
-    print(f"image_dir: {image_dir}")
-    print(f"patient_score: {discovered.get('patient_score')}")
-    print(f"image_reason: {discovered.get('image_reason')}")
-    for note in discovered.get('notes', []):
-        print(f"note: {note}")
-
-    # 0) Startup self-check
-    config = {
-        'patient_folder': patient_folder,
-        'excel_path': my_excel,
-        'patient_id': current_patient,
-        'output_dir': output_dir,
-        'json_dir': json_dir,
-        'image_dir': image_dir,
-    }
-
-    ok, self_check_df, path_ctx = startup_self_check(config)
-
-    print("\n===== STARTUP SELF-CHECK =====")
-    for _, r in self_check_df.iterrows():
-        print(f"[{r['Status']}] {r['Check']} :: {r['Detail']}")
-
-    if not ok:
-        print("\nSelf-check failed. Stop gracefully.")
-        return {
-            'status': 'SELF_CHECK_FAILED',
-            'self_check': self_check_df,
+    if args.input_mode == 'stage2':
+        required_args = {
+            'stage2_json': args.stage2_json,
+            'base_table': args.base_table,
+            'case_id': args.case_id,
+            'patient_id': args.patient_id,
+            'laterality': args.laterality,
         }
+        missing_args = [key for key, value in required_args.items() if not value]
+        if missing_args:
+            print(f"Missing required stage2 arguments: {missing_args}")
+            return {'status': 'INVALID_ARGS', 'missing': missing_args}
+
+        print("\n===== STAGE2 INPUT CONFIG =====")
+        print(f"stage2_json: {args.stage2_json}")
+        print(f"base_table: {args.base_table}")
+        print(f"case_id: {args.case_id}")
+        print(f"patient_id: {args.patient_id}")
+        print(f"laterality: {str(args.laterality).strip().upper()}")
+
+        config = {
+            'input_mode': 'stage2',
+            'stage2_json': args.stage2_json,
+            'base_table_path': args.base_table,
+            'case_id': args.case_id,
+            'patient_id': args.patient_id,
+            'laterality': str(args.laterality).strip().upper(),
+            'output_dir': output_dir,
+        }
+        ok, self_check_df, stage2_ctx = startup_self_check(config)
+
+        print("\n===== STAGE2 CONTRACT CHECK =====")
+        for _, r in self_check_df.iterrows():
+            print(f"[{r['Status']}] {r['Check']} :: {r['Detail']}")
+
+        if not ok:
+            print("\nStage2 contract check failed. Stop gracefully.")
+            return {
+                'status': 'SELF_CHECK_FAILED',
+                'self_check': self_check_df,
+            }
+
+        stage2_case = stage2_ctx['stage2_case']
+        baseline_row = stage2_ctx['baseline_row']
+        shared_case = build_stage3_shared_structure(stage2_case, baseline_row)
+        final_cloud = build_legacy_cloud_from_shared(shared_case)
+        mrw_segments_list = extract_mrw_segments_from_cloud(final_cloud)
+
+        baseline_info = {
+            'axial_length': float(baseline_row['Axial_Length']),
+            'laterality': str(baseline_row['Laterality']).strip().upper(),
+        }
+        current_patient = str(stage2_case['patient_id'])
+        run_case_id = str(stage2_case['case_id'])
+    else:
+        my_excel = args.legacy_excel_path or args.base_table
+        patient_folder = args.legacy_patient_folder
+        current_patient = args.patient_id or current_patient
+
+        configured_paths = {
+            'excel_path': my_excel,
+            'patient_folder': patient_folder,
+            'patient_id': current_patient,
+        }
+        discovered = auto_discover_paths(os.getcwd(), patient_id_hint=current_patient, excel_hint=my_excel)
+
+        if discovered.get('excel_path') and not my_excel:
+            my_excel = discovered['excel_path']
+        if discovered.get('patient_folder') and not patient_folder:
+            patient_folder = discovered['patient_folder']
+
+        json_dir = args.legacy_json_dir or discovered.get('json_dir') or (
+            os.path.join(patient_folder, 'JSONs') if patient_folder else None
+        )
+        image_dir = args.legacy_image_dir or discovered.get('image_dir')
+        if not image_dir and patient_folder and json_dir:
+            image_pick = choose_image_dir(patient_folder, json_dir)
+            image_dir = image_pick['image_dir']
+
+        print("\n===== LEGACY PATH CONFIG (configured) =====")
+        print(f"excel_path: {configured_paths['excel_path']}")
+        print(f"patient_folder: {configured_paths['patient_folder']}")
+        print(f"patient_id: {configured_paths['patient_id']}")
+
+        print("\n===== LEGACY PATH CONFIG (resolved) =====")
+        print(f"excel_path: {my_excel}")
+        print(f"patient_folder: {patient_folder}")
+        print(f"json_dir: {json_dir}")
+        print(f"image_dir: {image_dir}")
+        print(f"patient_score: {discovered.get('patient_score')}")
+        print(f"image_reason: {discovered.get('image_reason')}")
+        for note in discovered.get('notes', []):
+            print(f"note: {note}")
+
+        config = {
+            'input_mode': 'legacy',
+            'patient_folder': patient_folder,
+            'excel_path': my_excel,
+            'patient_id': current_patient,
+            'output_dir': output_dir,
+            'json_dir': json_dir,
+            'image_dir': image_dir,
+        }
+
+        ok, self_check_df, path_ctx = startup_self_check(config)
+
+        print("\n===== LEGACY STARTUP SELF-CHECK =====")
+        for _, r in self_check_df.iterrows():
+            print(f"[{r['Status']}] {r['Check']} :: {r['Detail']}")
+
+        if not ok:
+            print("\nLegacy self-check failed. Stop gracefully.")
+            return {
+                'status': 'SELF_CHECK_FAILED',
+                'self_check': self_check_df,
+            }
+
+        ret = load_legacy_labelme_case(
+            patient_folder,
+            my_excel,
+            current_patient,
+            json_dir=path_ctx.get('json_dir', json_dir),
+            image_dir=path_ctx.get('image_dir', image_dir),
+        )
+        if ret is None:
+            print("final_cloud generation failed. abort")
+            return None
+        final_cloud, mrw_segments_list = ret
+        baseline_info = read_patient_baseline(my_excel, current_patient, args.laterality)
+        run_case_id = args.case_id or current_patient
 
     print("\nSelf-check passed. Continue to full pipeline...")
 
-    # Clear only the formal output directory before this run.
     clear_formal_output_dir(output_dir)
     os.makedirs(qc_slice_dir, exist_ok=True)
-
-    # 1) Point cloud + Z-axis motion correction + traditional MRW extraction
-    ret = process_full_eye_to_3d_point_cloud(
-        patient_folder,
-        my_excel,
-        current_patient,
-        json_dir=path_ctx.get('json_dir', json_dir),
-        image_dir=path_ctx.get('image_dir', image_dir),
-    )
-    if ret is None:
-        print("final_cloud generation failed. abort")
-        return None
-    final_cloud, mrw_segments_list = ret
 
     # 2) BMO best-fit-plane alignment
     aligned_cloud = align_to_bmo_bfp(final_cloud)
@@ -2924,19 +3207,21 @@ def main():
     save_slice_qc_figures(payload_map, mrw_segments_list, gardiner_local_list, qc_slice_dir, final_cloud, aligned_cloud)
 
     # 8) Export one final Excel workbook
-    baseline = read_patient_baseline(my_excel, current_patient)
-    laterality = aligned_cloud.get('laterality') or baseline.get('laterality')
+    laterality = aligned_cloud.get('laterality') or baseline_info.get('laterality')
     axial_length = aligned_cloud.get('axial_length')
     if axial_length is None or not np.isfinite(axial_length):
-        axial_length = baseline.get('axial_length')
+        axial_length = baseline_info.get('axial_length')
     z_status = aligned_cloud.get('z_stabilization_status', 'unknown')
 
     pass_mask = lcd_lcci_df['status'] == 'PASS' if 'status' in lcd_lcci_df.columns else pd.Series(dtype=bool)
     lcd_pass = lcd_lcci_df[pass_mask] if len(lcd_lcci_df) > 0 and len(pass_mask) == len(lcd_lcci_df) else lcd_lcci_df
 
+    workbook_path = os.path.join(output_dir, f"Final_Results_{run_case_id}.xlsx")
+
     run_summary_df = pd.DataFrame([
         {
             'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'case_id': run_case_id,
             'patient_id': current_patient,
             'laterality': laterality,
             'axial_length': float(axial_length) if axial_length is not None and np.isfinite(axial_length) else np.nan,

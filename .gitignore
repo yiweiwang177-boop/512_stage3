@@ -21,3 +21,6 @@ __pycache__/
 *.name
 *.idea
 *.xls
+*tests_tmp/
+*__pycache__/
+*.pytest_cache/
