@@ -33,8 +33,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$STAGE2_JSON" || -z "$CASE_ID" || -z "$PATIENT_ID" || -z "$LATERALITY" ]]; then
-  echo "Usage: scripts/run_stage3_cloud.sh --stage2-json <path> --case-id <id> --patient-id <id> --laterality <L|R> [--base-table <path>] [--output-dir <dir>] [extra args]" >&2
+if [[ -z "$STAGE2_JSON" ]]; then
+  echo "Usage: scripts/run_stage3_cloud.sh --stage2-json <path> [--base-table <path>] [--output-dir <dir>] [--case-id <id>] [--patient-id <id>] [--laterality <L|R>] [extra args]" >&2
   exit 1
 fi
 
@@ -42,10 +42,19 @@ CMD=(
   python zuizhong.py
   --input-mode stage2
   --stage2-json "$STAGE2_JSON"
-  --case-id "$CASE_ID"
-  --patient-id "$PATIENT_ID"
-  --laterality "$LATERALITY"
 )
+
+if [[ -n "$CASE_ID" ]]; then
+  CMD+=(--case-id "$CASE_ID")
+fi
+
+if [[ -n "$PATIENT_ID" ]]; then
+  CMD+=(--patient-id "$PATIENT_ID")
+fi
+
+if [[ -n "$LATERALITY" ]]; then
+  CMD+=(--laterality "$LATERALITY")
+fi
 
 if [[ -n "$BASE_TABLE" ]]; then
   CMD+=(--base-table "$BASE_TABLE")
@@ -63,4 +72,18 @@ echo "Running Stage3 from: $REPO_ROOT"
 echo "OCT_STAGE3_INPUT_ROOT=${OCT_STAGE3_INPUT_ROOT:-}"
 echo "OCT_BASELINE_ROOT=${OCT_BASELINE_ROOT:-}"
 echo "OCT_OUTPUT_ROOT=${OCT_OUTPUT_ROOT:-}"
+python - "$STAGE2_JSON" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    print(f"json.case_id={payload.get('case_id')}")
+    print(f"json.patient_id={payload.get('patient_id')}")
+    print(f"json.laterality={payload.get('laterality')}")
+except Exception as exc:
+    print(f"json.identity_read_failed={exc}")
+PY
 "${CMD[@]}"

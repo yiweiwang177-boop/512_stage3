@@ -1923,6 +1923,7 @@ def validate_stage3_stage2_contract(config):
     case_id = config.get('case_id')
     patient_id = config.get('patient_id')
     laterality = str(config.get('laterality', '')).strip().upper()
+    stage2_case = config.get('stage2_case')
 
     stage2_exists = bool(stage2_json) and os.path.isfile(stage2_json)
     base_requested = bool(base_table_path)
@@ -1937,13 +1938,13 @@ def validate_stage3_stage2_contract(config):
         },
     ])
 
-    stage2_case = None
     baseline_row = {}
     ok_contract = False
 
     if stage2_exists:
         try:
-            stage2_case = load_stage2_case(stage2_json, expected_case_id=case_id)
+            if stage2_case is None:
+                stage2_case = load_stage2_case(stage2_json, expected_case_id=None)
             if base_exists:
                 baseline_row = load_patient_baseline_row(base_table_path, patient_id, laterality)
             contract_records = validate_stage3_input_contract(stage2_case, baseline_row)
@@ -3370,7 +3371,7 @@ def _resolve_path_with_root(path_value, env_root_name):
 def _default_output_dir(run_key):
     output_root = os.environ.get('OCT_OUTPUT_ROOT')
     base_dir = output_root if output_root else os.path.join(os.getcwd(), 'runs')
-    safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', str(run_key or 'stage3_case')).strip('_') or 'stage3_case'
+    safe_name = _make_safe_run_key(run_key)
     return os.path.abspath(os.path.join(base_dir, safe_name))
 
 
@@ -3378,6 +3379,10 @@ def _resolve_output_dir(output_dir_arg, run_key):
     if output_dir_arg:
         return _resolve_path_with_root(output_dir_arg, 'OCT_OUTPUT_ROOT')
     return _default_output_dir(run_key)
+
+
+def _make_safe_run_key(value):
+    return re.sub(r'[^A-Za-z0-9._-]+', '_', str(value or 'stage3_case')).strip('_') or 'stage3_case'
 
 
 def parse_args(argv=None):
@@ -3398,49 +3403,63 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    run_key_hint = args.case_id or args.patient_id or 'stage3_case'
-    output_dir = _resolve_output_dir(args.output_dir, run_key_hint)
-    qc_slice_dir = os.path.join(output_dir, 'QC_Slices')
-    qc_3d_dir = os.path.join(output_dir, 'qc_3d')
-
     self_check_df = pd.DataFrame()
     baseline_row = {}
     final_cloud = None
     mrw_segments_list = []
     run_case_id = args.case_id or args.patient_id or 'stage3_case'
     current_patient = args.patient_id or args.case_id or 'unknown_patient'
+    resolved_laterality = str(args.laterality).strip().upper() if args.laterality else ''
     stage2_schema_version = np.nan
+    output_dir = None
+    qc_slice_dir = None
+    qc_3d_dir = None
 
     if args.input_mode == 'stage2':
         stage2_json_path = _resolve_path_with_root(args.stage2_json, 'OCT_STAGE3_INPUT_ROOT')
         base_table_path = _resolve_path_with_root(args.base_table, 'OCT_BASELINE_ROOT')
-        required_args = {
-            'stage2_json': stage2_json_path,
-            'case_id': args.case_id,
-            'patient_id': args.patient_id,
-            'laterality': args.laterality,
-        }
-        missing_args = [key for key, value in required_args.items() if not value]
-        if missing_args:
-            print(f"Missing required stage2 arguments: {missing_args}")
-            return {'status': 'INVALID_ARGS', 'missing': missing_args}
+        if not stage2_json_path:
+            print("Missing required stage2 argument: stage2_json")
+            return {'status': 'INVALID_ARGS', 'missing': ['stage2_json']}
+
+        preloaded_stage2_case = None
+        preload_error = None
+        try:
+            preloaded_stage2_case = load_stage2_case(stage2_json_path, expected_case_id=None)
+        except Exception as exc:
+            preload_error = exc
+
+        if preloaded_stage2_case is not None:
+            run_case_id = str(args.case_id or preloaded_stage2_case.get('case_id') or run_case_id)
+            current_patient = str(args.patient_id or preloaded_stage2_case.get('patient_id') or current_patient)
+            resolved_laterality = str(args.laterality or preloaded_stage2_case.get('laterality') or '').strip().upper()
+        else:
+            run_case_id = str(args.case_id or run_case_id)
+            current_patient = str(args.patient_id or current_patient)
+
+        output_dir = _resolve_output_dir(args.output_dir, run_case_id)
+        qc_slice_dir = os.path.join(output_dir, 'QC_Slices')
+        qc_3d_dir = os.path.join(output_dir, 'qc_3d')
 
         print("\n===== STAGE2 INPUT CONFIG =====")
         print(f"stage2_json: {stage2_json_path}")
         print(f"base_table: {base_table_path}")
-        print(f"case_id: {args.case_id}")
-        print(f"patient_id: {args.patient_id}")
-        print(f"laterality: {str(args.laterality).strip().upper()}")
+        print(f"case_id: {run_case_id}")
+        print(f"patient_id: {current_patient}")
+        print(f"laterality: {resolved_laterality}")
         print(f"output_dir: {output_dir}")
+        if preload_error is not None:
+            print(f"stage2_preload: FAILED ({preload_error})")
 
         config = {
             'input_mode': 'stage2',
             'stage2_json': stage2_json_path,
             'base_table_path': base_table_path,
-            'case_id': args.case_id,
-            'patient_id': args.patient_id,
-            'laterality': str(args.laterality).strip().upper(),
+            'case_id': run_case_id,
+            'patient_id': current_patient,
+            'laterality': resolved_laterality,
             'output_dir': output_dir,
+            'stage2_case': preloaded_stage2_case,
         }
         ok, self_check_df, stage2_ctx = startup_self_check(config)
 
@@ -3457,6 +3476,9 @@ def main(argv=None):
 
         stage2_case = stage2_ctx['stage2_case']
         baseline_row = stage2_ctx.get('baseline_row') or {}
+        stage2_case['case_id'] = run_case_id
+        stage2_case['patient_id'] = current_patient
+        stage2_case['laterality'] = resolved_laterality
         shared_case = build_stage3_shared_structure(stage2_case, baseline_row)
         final_cloud = build_legacy_cloud_from_shared(shared_case)
         mrw_segments_list = extract_mrw_segments_from_cloud(final_cloud)
@@ -3465,6 +3487,9 @@ def main(argv=None):
         current_patient = str(stage2_case['patient_id'])
         run_case_id = str(stage2_case['case_id'])
     else:
+        output_dir = _resolve_output_dir(args.output_dir, run_case_id)
+        qc_slice_dir = os.path.join(output_dir, 'QC_Slices')
+        qc_3d_dir = os.path.join(output_dir, 'qc_3d')
         my_excel = args.legacy_excel_path or args.base_table
         patient_folder = args.legacy_patient_folder
         current_patient = args.patient_id or current_patient
@@ -3602,7 +3627,7 @@ def main(argv=None):
         axial_length = baseline_row.get('Axial_Length')
     z_status = aligned_cloud.get('z_stabilization_status', 'unknown')
 
-    workbook_path = os.path.join(output_dir, f"Final_Results_{run_case_id}.xlsx")
+    workbook_path = os.path.join(output_dir, f"Final_Results_{_make_safe_run_key(run_case_id)}.xlsx")
     master_df = build_master_table(
         case_id=run_case_id,
         patient_id=current_patient,

@@ -4,6 +4,7 @@ import os
 import shutil
 import unittest
 import uuid
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -23,6 +24,12 @@ def build_stage2_case_payload(
     include_legacy_aliases=False,
     include_axial_length=True,
     angle_offset=0.0,
+    include_slice_image_shape=True,
+    include_slice_dimensions=True,
+    include_case_dimensions=True,
+    case_id="CASE-001",
+    patient_id="P001",
+    laterality="R",
 ):
     slices = []
     for scan_index in range(1, n_slices + 1):
@@ -30,10 +37,7 @@ def build_stage2_case_payload(
         record = {
             "scan_index": scan_index,
             "slice_stem": f"slice_{scan_index:02d}",
-            "image_width": 10,
-            "image_height": 100,
             "angle_deg": float((scan_index - 1) * 15.0 + angle_offset),
-            "image_shape": [100, 10],
             "full_ilm_px": full_ilm,
             "bmo_left_px": [3.0, 40.0],
             "bmo_right_px": [6.0, 40.0],
@@ -43,6 +47,11 @@ def build_stage2_case_payload(
             "review_status": "approved",
             "source_flags": {"stage2_final": True},
         }
+        if include_slice_dimensions:
+            record["image_width"] = 10
+            record["image_height"] = 100
+        if include_slice_image_shape:
+            record["image_shape"] = [100, 10]
         if include_legacy_aliases:
             record["bmo_px"] = [[3.0, 40.0], [6.0, 40.0]]
             record["cutoff_px"] = [[2.0, 35.0], [7.0, 35.0]]
@@ -50,16 +59,17 @@ def build_stage2_case_payload(
 
     payload = {
         "stage2_schema_version": "v1",
-        "case_id": "CASE-001",
-        "patient_id": "P001",
-        "laterality": "R",
-        "image_width": 10,
-        "image_height": 100,
+        "case_id": case_id,
+        "patient_id": patient_id,
+        "laterality": laterality,
         "x_center": 5.0,
         "y_center": 50.0,
         "n_slices": n_slices,
         "slices": slices,
     }
+    if include_case_dimensions:
+        payload["image_width"] = 10
+        payload["image_height"] = 100
     if include_axial_length:
         payload["axial_length"] = 24.0
     return payload
@@ -158,6 +168,40 @@ class Stage3InputAdapterTests(unittest.TestCase):
         loaded = load_stage2_case(str(self.stage2_json), expected_case_id="CASE-001")
         self.assertEqual(loaded["slices"][0]["bmo_left_px"], (3.0, 40.0))
         self.assertEqual(loaded["slices"][0]["cutoff_right_px"], (7.0, 35.0))
+
+    def test_load_stage2_case_supports_case_level_dimension_fallback(self):
+        payload = build_stage2_case_payload(
+            include_slice_image_shape=False,
+            include_slice_dimensions=False,
+            include_case_dimensions=True,
+        )
+        with open(self.stage2_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+        loaded = load_stage2_case(str(self.stage2_json), expected_case_id="CASE-001")
+        baseline_row = load_patient_baseline_row(str(self.base_table), "P001", "R")
+        records = validate_stage3_input_contract(loaded, baseline_row)
+        status_map = {item["Check"]: item["Status"] for item in records}
+
+        self.assertEqual(loaded["slices"][0]["image_shape"], (100, 10))
+        self.assertEqual(loaded["slices"][0]["image_width"], 10)
+        self.assertEqual(loaded["slices"][0]["image_height"], 100)
+        self.assertEqual(status_map["slice:1:dimensions_resolvable"], "PASS")
+
+    def test_split_geometry_wins_over_conflicting_legacy_aliases(self):
+        payload = build_stage2_case_payload(include_legacy_aliases=True)
+        payload["slices"][0]["bmo_px"] = [[1.0, 10.0], [9.0, 10.0]]
+        payload["slices"][0]["cutoff_px"] = [[0.0, 11.0], [9.0, 11.0]]
+        with open(self.stage2_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            loaded = load_stage2_case(str(self.stage2_json), expected_case_id="CASE-001")
+
+        self.assertEqual(loaded["slices"][0]["bmo_left_px"], (3.0, 40.0))
+        self.assertEqual(loaded["slices"][0]["cutoff_right_px"], (7.0, 35.0))
+        self.assertTrue(any("ignored because" in str(item.message) for item in caught))
 
     def test_validate_contract_requires_12_slices(self):
         payload = build_stage2_case_payload(n_slices=11)
@@ -318,6 +362,128 @@ class Stage3InputAdapterTests(unittest.TestCase):
         self.assertEqual(first_slice["center_source"], "image_center")
         self.assertEqual(captured["cloud"]["z_stabilization_status"], "inactive_stage2_no_z_correction")
 
+    def test_stage2_mode_runs_from_canonical_json_without_manual_identity_args(self):
+        module = load_stage3_main_module()
+        output_dir = self.root / "out_native"
+        captured = {}
+
+        def capture_align(cloud):
+            captured["cloud"] = cloud
+            return {
+                "laterality": cloud.get("laterality", "R"),
+                "axial_length": cloud.get("axial_length", 24.0),
+                "z_stabilization_status": cloud.get("z_stabilization_status"),
+                "BMO_META": [],
+                "ALI_META": [],
+                "ALCS_META": [],
+                "SLICE_META": cloud.get("SLICE_META", {}),
+                "BMO": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.5, 0.0]],
+            }
+
+        with mock.patch.object(module, "align_to_bmo_bfp") as mock_align, mock.patch.object(
+            module, "prepare_mrw_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "calculate_gardiner_mra", return_value=([], 0.0)
+        ), mock.patch.object(
+            module, "prepare_mra_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "compute_traditional_lcd_lcci_all_slices", return_value=(pd.DataFrame(), {})
+        ), mock.patch.object(
+            module, "prepare_lcd_lcci_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "build_sector_summary_from_tables", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "save_slice_qc_figures", return_value=None
+        ), mock.patch.object(
+            module, "save_stage3_qc_3d_views", return_value=[]
+        ), mock.patch.object(
+            module, "export_results_excel", return_value=None
+        ):
+            mock_align.side_effect = capture_align
+            result = module.main(
+                [
+                    "--input-mode",
+                    "stage2",
+                    "--stage2-json",
+                    str(self.stage2_json),
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(captured["cloud"]["laterality"], "R")
+        self.assertFalse(any("compat" in path.name.lower() for path in self.root.rglob("*") if path.is_file()))
+
+    def test_stage2_mode_cli_overrides_json_identity(self):
+        module = load_stage3_main_module()
+        output_dir = self.root / "out_override"
+        captured = {}
+
+        def capture_align(cloud):
+            captured["cloud"] = cloud
+            return {
+                "laterality": cloud.get("laterality", "L"),
+                "axial_length": cloud.get("axial_length", 24.0),
+                "z_stabilization_status": cloud.get("z_stabilization_status"),
+                "BMO_META": [],
+                "ALI_META": [],
+                "ALCS_META": [],
+                "SLICE_META": cloud.get("SLICE_META", {}),
+                "BMO": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.5, 0.0]],
+            }
+
+        exported = {}
+
+        def capture_export(workbook_path, master_df, *_args):
+            exported["workbook_path"] = workbook_path
+            exported["master_df"] = master_df.copy()
+
+        with mock.patch.object(module, "align_to_bmo_bfp") as mock_align, mock.patch.object(
+            module, "prepare_mrw_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "calculate_gardiner_mra", return_value=([], 0.0)
+        ), mock.patch.object(
+            module, "prepare_mra_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "compute_traditional_lcd_lcci_all_slices", return_value=(pd.DataFrame(), {})
+        ), mock.patch.object(
+            module, "prepare_lcd_lcci_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "build_sector_summary_from_tables", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "save_slice_qc_figures", return_value=None
+        ), mock.patch.object(
+            module, "save_stage3_qc_3d_views", return_value=[]
+        ), mock.patch.object(
+            module, "export_results_excel", side_effect=capture_export
+        ):
+            mock_align.side_effect = capture_align
+            result = module.main(
+                [
+                    "--input-mode",
+                    "stage2",
+                    "--stage2-json",
+                    str(self.stage2_json),
+                    "--case-id",
+                    "CASE OVERRIDE 中文/#1",
+                    "--patient-id",
+                    "P-OVERRIDE",
+                    "--laterality",
+                    "L",
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(captured["cloud"]["patient_id"], "P-OVERRIDE")
+        self.assertEqual(captured["cloud"]["laterality"], "L")
+        self.assertEqual(exported["master_df"].iloc[0]["case_id"], "CASE OVERRIDE 中文/#1")
+        self.assertEqual(exported["master_df"].iloc[0]["patient_id"], "P-OVERRIDE")
+        self.assertEqual(exported["master_df"].iloc[0]["laterality"], "L")
+        self.assertTrue(str(exported["workbook_path"]).endswith("Final_Results_CASE_OVERRIDE_1.xlsx"))
+
     def test_stage2_mode_fails_without_base_table_when_axial_length_missing(self):
         module = load_stage3_main_module()
         payload = build_stage2_case_payload(include_axial_length=False)
@@ -418,6 +584,66 @@ class Stage3InputAdapterTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "OK")
         self.assertEqual(Path(result["output_dir"]), output_root / "CASE-001")
+
+    def test_stage2_mode_uses_ascii_safe_output_key_without_changing_master_identity(self):
+        module = load_stage3_main_module()
+        output_root = self.root / "output_ascii"
+        output_root.mkdir()
+        payload = build_stage2_case_payload(case_id="病例 A/01", patient_id="P空 格")
+        with open(self.stage2_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+        exported = {}
+
+        def capture_export(workbook_path, master_df, *_args):
+            exported["workbook_path"] = workbook_path
+            exported["master_df"] = master_df.copy()
+
+        with mock.patch.dict(
+            os.environ,
+            {"OCT_OUTPUT_ROOT": str(output_root)},
+            clear=False,
+        ), mock.patch.object(module, "align_to_bmo_bfp") as mock_align, mock.patch.object(
+            module, "prepare_mrw_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "calculate_gardiner_mra", return_value=([], 0.0)
+        ), mock.patch.object(
+            module, "prepare_mra_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "compute_traditional_lcd_lcci_all_slices", return_value=(pd.DataFrame(), {})
+        ), mock.patch.object(
+            module, "prepare_lcd_lcci_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "build_sector_summary_from_tables", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "save_slice_qc_figures", return_value=None
+        ), mock.patch.object(
+            module, "save_stage3_qc_3d_views", return_value=[]
+        ), mock.patch.object(
+            module, "export_results_excel", side_effect=capture_export
+        ):
+            mock_align.return_value = {
+                "laterality": "R",
+                "axial_length": 24.0,
+                "z_stabilization_status": "inactive_stage2_no_z_correction",
+                "BMO_META": [],
+                "ALI_META": [],
+                "ALCS_META": [],
+                "SLICE_META": {},
+                "BMO": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.5, 0.0]],
+            }
+            result = module.main(
+                [
+                    "--input-mode",
+                    "stage2",
+                    "--stage2-json",
+                    str(self.stage2_json),
+                ]
+            )
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(Path(result["output_dir"]), output_root / "A_01")
+        self.assertEqual(exported["master_df"].iloc[0]["case_id"], "病例 A/01")
 
     def test_stage2_mode_does_not_require_center_ilm(self):
         module = load_stage3_main_module()

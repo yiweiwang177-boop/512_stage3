@@ -97,35 +97,6 @@ def _prefer_non_null(*values: Any) -> Any:
     return None
 
 
-def _resolve_slice_lr_points(
-    slice_raw: Dict[str, Any],
-    *,
-    left_key: str,
-    right_key: str,
-    compat_key: str,
-) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    left_pt = slice_raw.get(left_key)
-    right_pt = slice_raw.get(right_key)
-    if left_pt is not None and right_pt is not None:
-        ordered = sorted(
-            [
-                (float(left_pt[0]), float(left_pt[1])),
-                (float(right_pt[0]), float(right_pt[1])),
-            ],
-            key=lambda item: item[0],
-        )
-        return ordered[0], ordered[-1]
-
-    compat_pts = slice_raw.get(compat_key)
-    if compat_pts is None:
-        raise KeyError(left_key)
-    ordered = sorted(
-        [(float(pt[0]), float(pt[1])) for pt in compat_pts],
-        key=lambda item: item[0],
-    )
-    return ordered[0], ordered[-1]
-
-
 def _split_full_ilm_for_legacy(slice_meta: SliceMeta) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
     pts = sorted(slice_meta.full_ilm_px, key=lambda item: item[0])
     left_cutoff_x = float(slice_meta.cutoff_left_px[0])
@@ -194,8 +165,11 @@ def build_stage3_shared_structure(
     baseline_row = baseline_row or {}
     slices = sorted(stage2_case["slices"], key=lambda item: item["scan_index"])
     first = slices[0]
-    case_image_width = int(stage2_case.get("image_width", first["image_width"]))
-    case_image_height = int(stage2_case.get("image_height", first["image_height"]))
+    first_shape = _coerce_optional_image_shape(first.get("image_shape"))
+    fallback_width = first["image_width"] if "image_width" in first else (first_shape[1] if first_shape else None)
+    fallback_height = first["image_height"] if "image_height" in first else (first_shape[0] if first_shape else None)
+    case_image_width = int(stage2_case.get("image_width", fallback_width))
+    case_image_height = int(stage2_case.get("image_height", fallback_height))
     default_x_center, default_y_center = _image_center(case_image_width, case_image_height)
     case_x_center = _coerce_optional_float(stage2_case.get("x_center"))
     case_y_center = _coerce_optional_float(stage2_case.get("y_center"))
@@ -230,27 +204,20 @@ def build_stage3_shared_structure(
 
     for slice_raw in slices:
         scan_index = int(slice_raw["scan_index"])
-        image_height = int(slice_raw["image_height"])
-        image_width = int(slice_raw["image_width"])
+        image_shape = _coerce_optional_image_shape(slice_raw.get("image_shape"))
+        if image_shape is None:
+            raise ValueError(f"slice {scan_index} missing normalized image_shape")
+        image_height, image_width = image_shape
         default_slice_x_center, default_slice_y_center = _image_center(image_width, image_height)
-        image_shape = _coerce_optional_image_shape(slice_raw.get("image_shape")) or (image_height, image_width)
         angle_deg = _coerce_optional_float(slice_raw.get("angle_deg"))
         if angle_deg is None:
             angle_deg = (scan_index - 1) * 15.0
         x_center = case_x_center if case_x_center is not None else default_slice_x_center
         y_center = case_y_center if case_y_center is not None else default_slice_y_center
-        bmo_left_px, bmo_right_px = _resolve_slice_lr_points(
-            slice_raw,
-            left_key="bmo_left_px",
-            right_key="bmo_right_px",
-            compat_key="bmo_px",
-        )
-        cutoff_left_px, cutoff_right_px = _resolve_slice_lr_points(
-            slice_raw,
-            left_key="cutoff_left_px",
-            right_key="cutoff_right_px",
-            compat_key="cutoff_px",
-        )
+        bmo_left_px = tuple(slice_raw["bmo_left_px"])
+        bmo_right_px = tuple(slice_raw["bmo_right_px"])
+        cutoff_left_px = tuple(slice_raw["cutoff_left_px"])
+        cutoff_right_px = tuple(slice_raw["cutoff_right_px"])
 
         slice_meta = SliceMeta(
             slice_id=scan_index,

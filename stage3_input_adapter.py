@@ -1,5 +1,6 @@
 import json
 import os
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -10,8 +11,6 @@ REQUIRED_CASE_FIELDS = ["stage2_schema_version", "case_id", "patient_id", "later
 REQUIRED_SLICE_FIELDS = [
     "scan_index",
     "slice_stem",
-    "image_width",
-    "image_height",
     "full_ilm_px",
     "rnfl_effective_lower_px",
 ]
@@ -62,19 +61,59 @@ def _coerce_optional_image_shape(value: Any) -> Optional[Tuple[int, int]]:
         raise ValueError("image_shape must be numeric") from exc
 
 
+def _coerce_resolved_image_shape(
+    slice_raw: Dict[str, Any],
+    case_raw: Dict[str, Any],
+) -> Tuple[Tuple[int, int], int, int]:
+    image_shape = _coerce_optional_image_shape(slice_raw.get("image_shape"))
+    if image_shape is not None:
+        return image_shape, image_shape[1], image_shape[0]
+
+    slice_width = _coerce_optional_float(slice_raw.get("image_width"), "image_width")
+    slice_height = _coerce_optional_float(slice_raw.get("image_height"), "image_height")
+    if slice_width is not None and slice_height is not None:
+        width = int(slice_width)
+        height = int(slice_height)
+        return (height, width), width, height
+
+    case_width = _coerce_optional_float(case_raw.get("image_width"), "image_width")
+    case_height = _coerce_optional_float(case_raw.get("image_height"), "image_height")
+    if case_width is not None and case_height is not None:
+        width = int(case_width)
+        height = int(case_height)
+        return (height, width), width, height
+
+    raise ValueError(
+        "missing slice dimensions: provide image_shape, slice image_width/image_height, "
+        "or case image_width/image_height"
+    )
+
+
 def _resolve_lr_points(
     slice_raw: Dict[str, Any],
     *,
     left_key: str,
     right_key: str,
     compat_key: str,
-    field_prefix: str,
 ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
     left_raw = slice_raw.get(left_key)
     right_raw = slice_raw.get(right_key)
     if left_raw is not None and right_raw is not None:
         left_pt = _coerce_point(left_raw, left_key)
         right_pt = _coerce_point(right_raw, right_key)
+        compat_pts = slice_raw.get(compat_key)
+        if compat_pts is not None:
+            compat_ordered = sorted(
+                _coerce_polyline(compat_pts, compat_key, min_points=2, exact_points=2),
+                key=lambda item: item[0],
+            )
+            split_ordered = sorted([left_pt, right_pt], key=lambda item: item[0])
+            if compat_ordered != split_ordered:
+                warnings.warn(
+                    f"{compat_key} ignored because {left_key}/{right_key} are present",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         ordered = sorted([left_pt, right_pt], key=lambda item: item[0])
         return ordered[0], ordered[-1]
 
@@ -91,9 +130,13 @@ def _resolve_lr_points(
     return ordered[0], ordered[-1]
 
 
-def normalize_stage2_slice_record(slice_raw: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_stage2_slice_record(
+    slice_raw: Dict[str, Any],
+    case_raw: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     if not isinstance(slice_raw, dict):
         raise ValueError("slice record must be a JSON object")
+    case_raw = case_raw or {}
 
     normalized = {}
     for key in REQUIRED_SLICE_FIELDS:
@@ -103,10 +146,13 @@ def normalize_stage2_slice_record(slice_raw: Dict[str, Any]) -> Dict[str, Any]:
     try:
         normalized["scan_index"] = int(slice_raw["scan_index"])
         normalized["slice_stem"] = str(slice_raw["slice_stem"])
-        normalized["image_width"] = int(slice_raw["image_width"])
-        normalized["image_height"] = int(slice_raw["image_height"])
     except (TypeError, ValueError) as exc:
-        raise ValueError("scan_index/image_width/image_height must be numeric") from exc
+        raise ValueError("scan_index must be numeric") from exc
+
+    image_shape, image_width, image_height = _coerce_resolved_image_shape(slice_raw, case_raw)
+    normalized["image_shape"] = image_shape
+    normalized["image_width"] = image_width
+    normalized["image_height"] = image_height
 
     normalized["full_ilm_px"] = _coerce_polyline(
         slice_raw["full_ilm_px"], "full_ilm_px", min_points=2
@@ -116,14 +162,12 @@ def normalize_stage2_slice_record(slice_raw: Dict[str, Any]) -> Dict[str, Any]:
         left_key="bmo_left_px",
         right_key="bmo_right_px",
         compat_key="bmo_px",
-        field_prefix="bmo",
     )
     cutoff_left_px, cutoff_right_px = _resolve_lr_points(
         slice_raw,
         left_key="cutoff_left_px",
         right_key="cutoff_right_px",
         compat_key="cutoff_px",
-        field_prefix="cutoff",
     )
     normalized["bmo_left_px"] = bmo_left_px
     normalized["bmo_right_px"] = bmo_right_px
@@ -135,7 +179,6 @@ def normalize_stage2_slice_record(slice_raw: Dict[str, Any]) -> Dict[str, Any]:
         slice_raw["rnfl_effective_lower_px"], "rnfl_effective_lower_px", min_points=2
     )
     normalized["angle_deg"] = _coerce_optional_float(slice_raw.get("angle_deg"), "angle_deg")
-    normalized["image_shape"] = _coerce_optional_image_shape(slice_raw.get("image_shape"))
     normalized["review_status"] = slice_raw.get("review_status")
     normalized["source_flags"] = slice_raw.get("source_flags", {})
     normalized["image_path"] = slice_raw.get("image_path")
@@ -176,13 +219,25 @@ def load_stage2_case(stage2_json_path: str, expected_case_id: Optional[str] = No
     if not isinstance(raw_slices, list):
         raise ValueError("slices must be a list")
 
-    normalized_slices = [normalize_stage2_slice_record(item) for item in raw_slices]
+    normalized_slices = [normalize_stage2_slice_record(item, data) for item in raw_slices]
 
     normalized_case = dict(data)
     normalized_case["stage2_schema_version"] = schema_version
     normalized_case["case_id"] = case_id
     normalized_case["patient_id"] = str(data["patient_id"])
     normalized_case["laterality"] = laterality
+    if data.get("image_width") is not None:
+        normalized_case["image_width"] = int(float(data["image_width"]))
+    if data.get("image_height") is not None:
+        normalized_case["image_height"] = int(float(data["image_height"]))
+    if data.get("x_center") is not None:
+        normalized_case["x_center"] = float(data["x_center"])
+    if data.get("y_center") is not None:
+        normalized_case["y_center"] = float(data["y_center"])
+    if data.get("n_slices") is not None:
+        normalized_case["n_slices"] = int(float(data["n_slices"]))
+    if data.get("axial_length") is not None:
+        normalized_case["axial_length"] = float(data["axial_length"])
     normalized_case["slices"] = sorted(normalized_slices, key=lambda item: item["scan_index"])
     return normalized_case
 
@@ -276,29 +331,49 @@ def validate_stage3_input_contract(
                 "present" if has_field else "missing",
             )
             required_fields_ok = required_fields_ok and has_field
+        image_shape = item.get("image_shape")
+        width = item.get("image_width")
+        height = item.get("image_height")
+        dims_resolvable = (
+            image_shape is not None
+            or (width is not None and height is not None)
+            or (
+                stage2_case.get("image_width") is not None
+                and stage2_case.get("image_height") is not None
+            )
+        )
+        add(
+            f"slice:{sid}:dimensions_resolvable",
+            "PASS" if dims_resolvable else "FAIL",
+            "image_shape_or_width_height_resolved" if dims_resolvable else "missing",
+        )
+        required_fields_ok = required_fields_ok and dims_resolvable
+
         geometry_checks = [
-            ("bmo_left_px", "bmo_right_px"),
-            ("cutoff_left_px", "cutoff_right_px"),
+            ("bmo_left_px", "bmo_right_px", "bmo_px"),
+            ("cutoff_left_px", "cutoff_right_px", "cutoff_px"),
         ]
-        for left_key, right_key in geometry_checks:
-            has_pair = item.get(left_key) is not None and item.get(right_key) is not None
+        for left_key, right_key, compat_key in geometry_checks:
+            has_pair = (
+                item.get(left_key) is not None and item.get(right_key) is not None
+            ) or item.get(compat_key) is not None
             add(
-                f"slice:{sid}:{left_key}/{right_key}",
+                f"slice:{sid}:{left_key}/{right_key}_resolvable",
                 "PASS" if has_pair else "FAIL",
-                "present" if has_pair else "missing",
+                "resolved" if has_pair else "missing",
             )
             required_fields_ok = required_fields_ok and has_pair
 
-    widths = {int(item["image_width"]) for item in slices}
-    heights = {int(item["image_height"]) for item in slices}
+    widths = {int(item["image_width"]) for item in slices if item.get("image_width") is not None}
+    heights = {int(item["image_height"]) for item in slices if item.get("image_height") is not None}
     add(
         "stage2:image_width_present",
-        "PASS" if all(width > 0 for width in widths) else "FAIL",
+        "PASS" if widths and all(width > 0 for width in widths) else "FAIL",
         f"widths={sorted(widths)}",
     )
     add(
         "stage2:image_height_present",
-        "PASS" if all(height > 0 for height in heights) else "FAIL",
+        "PASS" if heights and all(height > 0 for height in heights) else "FAIL",
         f"heights={sorted(heights)}",
     )
 

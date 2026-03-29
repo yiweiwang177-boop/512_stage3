@@ -1,11 +1,15 @@
 import copy
 import importlib.util
+import json
+import shutil
 import unittest
+import uuid
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from stage3_input_adapter import load_stage2_case
 from stage3_canonical_access import (
     build_aligned_canonical_slice_geometry,
     build_unaligned_canonical_slice_geometry,
@@ -83,7 +87,18 @@ def build_case_artifacts(module, payload):
         "Diagnosis": "Dx",
         "Stage": "S1",
     }
-    shared_case = build_stage3_shared_structure(payload, baseline_row)
+    workspace_tmp = Path(__file__).resolve().parents[1] / "tests_tmp"
+    workspace_tmp.mkdir(exist_ok=True)
+    root = workspace_tmp / f"canonical_migration_{uuid.uuid4().hex}"
+    root.mkdir(parents=True, exist_ok=True)
+    stage2_json = root / "case.json"
+    try:
+        with open(stage2_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        stage2_case = load_stage2_case(str(stage2_json), expected_case_id=payload["case_id"])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    shared_case = build_stage3_shared_structure(stage2_case, baseline_row)
     final_cloud = build_legacy_cloud_from_shared(shared_case)
     aligned_cloud = module.align_to_bmo_bfp(final_cloud)
     return shared_case, final_cloud, aligned_cloud
