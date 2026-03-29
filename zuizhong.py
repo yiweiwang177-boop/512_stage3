@@ -33,6 +33,7 @@ from stage3_input_adapter import (
     validate_stage3_input_contract,
 )
 from stage3_shared import build_legacy_cloud_from_shared, build_stage3_shared_structure
+from stage3_visualization import save_stage3_qc_3d_views
 
 try:
     if hasattr(sys.stdout, 'reconfigure'):
@@ -144,7 +145,7 @@ def auto_discover_paths(base_dir, patient_id_hint=None, excel_hint=None):
     # 2) Patient folder + JSON/image discovery
     hint_norm = normalize_identifier(patient_id_hint)
     patient_candidates = []
-    skip_names = {'.idea', '.venv', '__pycache__', 'Final_Analysis_Output'}
+    skip_names = {'.idea', '.venv', '__pycache__', 'Final_Analysis_Output', 'runs'}
 
     for entry in sorted(os.scandir(base_dir), key=lambda e: e.name):
         if not entry.is_dir():
@@ -3352,13 +3353,40 @@ def export_results_excel(workbook_path, master_df, run_summary_df, self_check_df
         sector_df.to_excel(writer, sheet_name='Sector_Summary', index=False)
 
 
+def _resolve_path_with_root(path_value, env_root_name):
+    if not path_value:
+        return None
+    path_str = str(path_value)
+    if os.path.isabs(path_str):
+        return path_str
+    if os.path.exists(path_str):
+        return os.path.abspath(path_str)
+    env_root = os.environ.get(env_root_name)
+    if env_root:
+        return os.path.abspath(os.path.join(env_root, path_str))
+    return os.path.abspath(path_str)
+
+
+def _default_output_dir(run_key):
+    output_root = os.environ.get('OCT_OUTPUT_ROOT')
+    base_dir = output_root if output_root else os.path.join(os.getcwd(), 'runs')
+    safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', str(run_key or 'stage3_case')).strip('_') or 'stage3_case'
+    return os.path.abspath(os.path.join(base_dir, safe_name))
+
+
+def _resolve_output_dir(output_dir_arg, run_key):
+    if output_dir_arg:
+        return _resolve_path_with_root(output_dir_arg, 'OCT_OUTPUT_ROOT')
+    return _default_output_dir(run_key)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='Stage3 first-pass refactor entry')
     parser.add_argument('--input-mode', choices=['stage2', 'legacy'], default='stage2')
     parser.add_argument('--stage2-json')
     parser.add_argument('--base-table')
     parser.add_argument('--case-id')
-    parser.add_argument('--output-dir', default=os.path.join(os.getcwd(), 'Final_Analysis_Output'))
+    parser.add_argument('--output-dir')
     parser.add_argument('--patient-id')
     parser.add_argument('--laterality')
     parser.add_argument('--legacy-patient-folder')
@@ -3370,8 +3398,10 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    output_dir = args.output_dir
+    run_key_hint = args.case_id or args.patient_id or 'stage3_case'
+    output_dir = _resolve_output_dir(args.output_dir, run_key_hint)
     qc_slice_dir = os.path.join(output_dir, 'QC_Slices')
+    qc_3d_dir = os.path.join(output_dir, 'qc_3d')
 
     self_check_df = pd.DataFrame()
     baseline_row = {}
@@ -3382,8 +3412,10 @@ def main(argv=None):
     stage2_schema_version = np.nan
 
     if args.input_mode == 'stage2':
+        stage2_json_path = _resolve_path_with_root(args.stage2_json, 'OCT_STAGE3_INPUT_ROOT')
+        base_table_path = _resolve_path_with_root(args.base_table, 'OCT_BASELINE_ROOT')
         required_args = {
-            'stage2_json': args.stage2_json,
+            'stage2_json': stage2_json_path,
             'case_id': args.case_id,
             'patient_id': args.patient_id,
             'laterality': args.laterality,
@@ -3394,16 +3426,17 @@ def main(argv=None):
             return {'status': 'INVALID_ARGS', 'missing': missing_args}
 
         print("\n===== STAGE2 INPUT CONFIG =====")
-        print(f"stage2_json: {args.stage2_json}")
-        print(f"base_table: {args.base_table}")
+        print(f"stage2_json: {stage2_json_path}")
+        print(f"base_table: {base_table_path}")
         print(f"case_id: {args.case_id}")
         print(f"patient_id: {args.patient_id}")
         print(f"laterality: {str(args.laterality).strip().upper()}")
+        print(f"output_dir: {output_dir}")
 
         config = {
             'input_mode': 'stage2',
-            'stage2_json': args.stage2_json,
-            'base_table_path': args.base_table,
+            'stage2_json': stage2_json_path,
+            'base_table_path': base_table_path,
             'case_id': args.case_id,
             'patient_id': args.patient_id,
             'laterality': str(args.laterality).strip().upper(),
@@ -3460,6 +3493,7 @@ def main(argv=None):
         print(f"excel_path: {configured_paths['excel_path']}")
         print(f"patient_folder: {configured_paths['patient_folder']}")
         print(f"patient_id: {configured_paths['patient_id']}")
+        print(f"output_dir: {output_dir}")
 
         print("\n===== LEGACY PATH CONFIG (resolved) =====")
         print(f"excel_path: {my_excel}")
@@ -3555,6 +3589,11 @@ def main(argv=None):
 
     # 7) Visualization-based QC
     save_slice_qc_figures(payload_map, mrw_segments_list, gardiner_local_list, qc_slice_dir, final_cloud, aligned_cloud)
+    qc_3d_files = []
+    try:
+        qc_3d_files = save_stage3_qc_3d_views(qc_3d_dir, aligned_cloud)
+    except Exception as exc:
+        print(f"[QC3D] export failed: {exc}")
 
     # 8) Export one final Excel workbook
     laterality = aligned_cloud.get('laterality') or baseline_row.get('Laterality')
@@ -3600,10 +3639,17 @@ def main(argv=None):
     print("\nPipeline completed.")
     print(f"Workbook: {workbook_path}")
     print(f"QC slice figures: {qc_slice_dir}")
+    if qc_3d_files:
+        print(f"QC 3D directory: {qc_3d_dir}")
+        for path in qc_3d_files:
+            print(f"QC 3D file: {path}")
 
     return {
         'status': 'OK',
         'workbook': workbook_path,
+        'output_dir': output_dir,
+        'qc_3d_dir': qc_3d_dir,
+        'qc_3d_files': qc_3d_files,
         'mrw_mean_um': float(real_mean_mrw),
         'mra_global_mm2': float(global_mra_mm2),
         'self_check': self_check_df,

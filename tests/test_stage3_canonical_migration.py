@@ -51,7 +51,7 @@ def load_stage3_main_module():
     candidates = [
         path
         for path in root.glob("*.py")
-        if path.name not in {"stage3_input_adapter.py", "stage3_shared.py", "stage3_canonical_access.py"}
+        if path.name not in {"stage3_input_adapter.py", "stage3_shared.py", "stage3_canonical_access.py", "stage3_visualization.py"}
         and "pre" not in path.name.lower()
     ]
     assert len(candidates) == 1

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import shutil
 import unittest
 import uuid
@@ -79,7 +80,7 @@ def load_stage3_main_module():
     candidates = [
         path
         for path in root.glob("*.py")
-        if path.name not in {"stage3_input_adapter.py", "stage3_shared.py", "stage3_canonical_access.py"}
+        if path.name not in {"stage3_input_adapter.py", "stage3_shared.py", "stage3_canonical_access.py", "stage3_visualization.py"}
         and "pre" not in path.name.lower()
     ]
     assert len(candidates) == 1
@@ -346,6 +347,77 @@ class Stage3InputAdapterTests(unittest.TestCase):
             for _, row in result["self_check"].iterrows()
         }
         self.assertEqual(checks["stage2:axial_length_available"], "FAIL")
+
+    def test_stage2_mode_resolves_env_roots_and_default_output_root(self):
+        module = load_stage3_main_module()
+        input_root = self.root / "input_root"
+        baseline_root = self.root / "baseline_root"
+        output_root = self.root / "output_root"
+        input_root.mkdir()
+        baseline_root.mkdir()
+        output_root.mkdir()
+
+        stage2_json_name = "case_env.json"
+        base_table_name = "baseline_env.xlsx"
+        shutil.copy2(self.stage2_json, input_root / stage2_json_name)
+        shutil.copy2(self.base_table, baseline_root / base_table_name)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "OCT_STAGE3_INPUT_ROOT": str(input_root),
+                "OCT_BASELINE_ROOT": str(baseline_root),
+                "OCT_OUTPUT_ROOT": str(output_root),
+            },
+            clear=False,
+        ), mock.patch.object(module, "align_to_bmo_bfp") as mock_align, mock.patch.object(
+            module, "prepare_mrw_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "calculate_gardiner_mra", return_value=([], 0.0)
+        ), mock.patch.object(
+            module, "prepare_mra_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "compute_traditional_lcd_lcci_all_slices", return_value=(pd.DataFrame(), {})
+        ), mock.patch.object(
+            module, "prepare_lcd_lcci_dataframe", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "build_sector_summary_from_tables", return_value=pd.DataFrame()
+        ), mock.patch.object(
+            module, "save_slice_qc_figures", return_value=None
+        ), mock.patch.object(
+            module, "save_stage3_qc_3d_views", return_value=[]
+        ), mock.patch.object(
+            module, "export_results_excel", return_value=None
+        ):
+            mock_align.return_value = {
+                "laterality": "R",
+                "axial_length": 24.0,
+                "z_stabilization_status": "inactive_stage2_no_z_correction",
+                "BMO_META": [],
+                "ALI_META": [],
+                "ALCS_META": [],
+                "SLICE_META": {},
+                "BMO": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.5, 0.0]],
+            }
+            result = module.main(
+                [
+                    "--input-mode",
+                    "stage2",
+                    "--stage2-json",
+                    stage2_json_name,
+                    "--base-table",
+                    base_table_name,
+                    "--case-id",
+                    "CASE-001",
+                    "--patient-id",
+                    "P001",
+                    "--laterality",
+                    "R",
+                ]
+            )
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(Path(result["output_dir"]), output_root / "CASE-001")
 
     def test_stage2_mode_does_not_require_center_ilm(self):
         module = load_stage3_main_module()
