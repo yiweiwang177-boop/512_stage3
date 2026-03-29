@@ -13,8 +13,6 @@ REQUIRED_SLICE_FIELDS = [
     "image_width",
     "image_height",
     "full_ilm_px",
-    "bmo_px",
-    "cutoff_px",
     "rnfl_effective_lower_px",
 ]
 
@@ -44,6 +42,55 @@ def _coerce_polyline(
     return [_coerce_point(pt, field_name) for pt in points]
 
 
+def _coerce_optional_float(value: Any, field_name: str) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be numeric") from exc
+
+
+def _coerce_optional_image_shape(value: Any) -> Optional[Tuple[int, int]]:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        raise ValueError("image_shape must be a 2-item list/tuple")
+    try:
+        return int(value[0]), int(value[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("image_shape must be numeric") from exc
+
+
+def _resolve_lr_points(
+    slice_raw: Dict[str, Any],
+    *,
+    left_key: str,
+    right_key: str,
+    compat_key: str,
+    field_prefix: str,
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    left_raw = slice_raw.get(left_key)
+    right_raw = slice_raw.get(right_key)
+    if left_raw is not None and right_raw is not None:
+        left_pt = _coerce_point(left_raw, left_key)
+        right_pt = _coerce_point(right_raw, right_key)
+        ordered = sorted([left_pt, right_pt], key=lambda item: item[0])
+        return ordered[0], ordered[-1]
+
+    compat_pts = slice_raw.get(compat_key)
+    if compat_pts is None:
+        raise ValueError(
+            f"missing slice geometry: provide {left_key}/{right_key} or legacy {compat_key}"
+        )
+
+    ordered = sorted(
+        _coerce_polyline(compat_pts, compat_key, min_points=2, exact_points=2),
+        key=lambda item: item[0],
+    )
+    return ordered[0], ordered[-1]
+
+
 def normalize_stage2_slice_record(slice_raw: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(slice_raw, dict):
         raise ValueError("slice record must be a JSON object")
@@ -64,15 +111,31 @@ def normalize_stage2_slice_record(slice_raw: Dict[str, Any]) -> Dict[str, Any]:
     normalized["full_ilm_px"] = _coerce_polyline(
         slice_raw["full_ilm_px"], "full_ilm_px", min_points=2
     )
-    normalized["bmo_px"] = _coerce_polyline(
-        slice_raw["bmo_px"], "bmo_px", min_points=2, exact_points=2
+    bmo_left_px, bmo_right_px = _resolve_lr_points(
+        slice_raw,
+        left_key="bmo_left_px",
+        right_key="bmo_right_px",
+        compat_key="bmo_px",
+        field_prefix="bmo",
     )
-    normalized["cutoff_px"] = _coerce_polyline(
-        slice_raw["cutoff_px"], "cutoff_px", min_points=2, exact_points=2
+    cutoff_left_px, cutoff_right_px = _resolve_lr_points(
+        slice_raw,
+        left_key="cutoff_left_px",
+        right_key="cutoff_right_px",
+        compat_key="cutoff_px",
+        field_prefix="cutoff",
     )
+    normalized["bmo_left_px"] = bmo_left_px
+    normalized["bmo_right_px"] = bmo_right_px
+    normalized["cutoff_left_px"] = cutoff_left_px
+    normalized["cutoff_right_px"] = cutoff_right_px
+    normalized["bmo_px"] = [bmo_left_px, bmo_right_px]
+    normalized["cutoff_px"] = [cutoff_left_px, cutoff_right_px]
     normalized["rnfl_effective_lower_px"] = _coerce_polyline(
         slice_raw["rnfl_effective_lower_px"], "rnfl_effective_lower_px", min_points=2
     )
+    normalized["angle_deg"] = _coerce_optional_float(slice_raw.get("angle_deg"), "angle_deg")
+    normalized["image_shape"] = _coerce_optional_image_shape(slice_raw.get("image_shape"))
     normalized["review_status"] = slice_raw.get("review_status")
     normalized["source_flags"] = slice_raw.get("source_flags", {})
     normalized["image_path"] = slice_raw.get("image_path")
@@ -158,7 +221,7 @@ def load_patient_baseline_row(
 
 def validate_stage3_input_contract(
     stage2_case: Dict[str, Any],
-    baseline_row: Dict[str, Any],
+    baseline_row: Optional[Dict[str, Any]],
 ) -> List[Dict[str, str]]:
     records: List[Dict[str, str]] = []
 
@@ -180,8 +243,12 @@ def validate_stage3_input_contract(
     baseline_ok = bool(baseline_row) and str(baseline_row.get("Patient_ID", "")).strip() != ""
     add(
         "baseline:matched_patient_laterality",
-        "PASS" if baseline_ok else "FAIL",
-        f"Patient_ID={baseline_row.get('Patient_ID')}, Laterality={baseline_row.get('Laterality')}",
+        "PASS" if baseline_ok or not baseline_row else "FAIL",
+        (
+            f"Patient_ID={baseline_row.get('Patient_ID')}, Laterality={baseline_row.get('Laterality')}"
+            if baseline_row
+            else "optional_not_provided"
+        ),
     )
 
     slices = stage2_case.get("slices", [])
@@ -209,6 +276,18 @@ def validate_stage3_input_contract(
                 "present" if has_field else "missing",
             )
             required_fields_ok = required_fields_ok and has_field
+        geometry_checks = [
+            ("bmo_left_px", "bmo_right_px"),
+            ("cutoff_left_px", "cutoff_right_px"),
+        ]
+        for left_key, right_key in geometry_checks:
+            has_pair = item.get(left_key) is not None and item.get(right_key) is not None
+            add(
+                f"slice:{sid}:{left_key}/{right_key}",
+                "PASS" if has_pair else "FAIL",
+                "present" if has_pair else "missing",
+            )
+            required_fields_ok = required_fields_ok and has_pair
 
     widths = {int(item["image_width"]) for item in slices}
     heights = {int(item["image_height"]) for item in slices}
@@ -227,5 +306,21 @@ def validate_stage3_input_contract(
         "stage2:required_fields_complete",
         "PASS" if required_fields_ok else "FAIL",
         "validated required slice fields",
+    )
+
+    axial_length_value = stage2_case.get("axial_length")
+    if axial_length_value is None and baseline_row:
+        axial_length_value = baseline_row.get("Axial_Length")
+    axial_length_ok = False
+    try:
+        axial_length_ok = axial_length_value is not None and pd.notna(axial_length_value)
+        if axial_length_ok:
+            float(axial_length_value)
+    except (TypeError, ValueError):
+        axial_length_ok = False
+    add(
+        "stage2:axial_length_available",
+        "PASS" if axial_length_ok else "FAIL",
+        str(axial_length_value),
     )
     return records

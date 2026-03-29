@@ -1924,22 +1924,27 @@ def validate_stage3_stage2_contract(config):
     laterality = str(config.get('laterality', '')).strip().upper()
 
     stage2_exists = bool(stage2_json) and os.path.isfile(stage2_json)
+    base_requested = bool(base_table_path)
     base_exists = bool(base_table_path) and os.path.isfile(base_table_path)
     all_records.extend([
         {'Check': 'path:stage2_json', 'Status': 'PASS' if stage2_exists else 'FAIL',
          'Detail': str(stage2_json)},
-        {'Check': 'path:base_table', 'Status': 'PASS' if base_exists else 'FAIL',
-         'Detail': str(base_table_path)},
+        {
+            'Check': 'path:base_table',
+            'Status': 'PASS' if (base_exists or not base_requested) else 'FAIL',
+            'Detail': str(base_table_path) if base_requested else 'optional_not_provided',
+        },
     ])
 
     stage2_case = None
-    baseline_row = None
+    baseline_row = {}
     ok_contract = False
 
-    if stage2_exists and base_exists:
+    if stage2_exists:
         try:
             stage2_case = load_stage2_case(stage2_json, expected_case_id=case_id)
-            baseline_row = load_patient_baseline_row(base_table_path, patient_id, laterality)
+            if base_exists:
+                baseline_row = load_patient_baseline_row(base_table_path, patient_id, laterality)
             contract_records = validate_stage3_input_contract(stage2_case, baseline_row)
             all_records.extend(contract_records)
             ok_contract = all(item['Status'] == 'PASS' for item in contract_records)
@@ -1954,7 +1959,7 @@ def validate_stage3_stage2_contract(config):
     all_records.extend(rec_out)
 
     self_check_df = pd.DataFrame(all_records)
-    overall_ok = ok_pkg and stage2_exists and base_exists and ok_contract and ok_out
+    overall_ok = ok_pkg and stage2_exists and ok_contract and ok_out
     context = {
         'stage2_case': stage2_case,
         'baseline_row': baseline_row,
@@ -3379,7 +3384,6 @@ def main(argv=None):
     if args.input_mode == 'stage2':
         required_args = {
             'stage2_json': args.stage2_json,
-            'base_table': args.base_table,
             'case_id': args.case_id,
             'patient_id': args.patient_id,
             'laterality': args.laterality,
@@ -3419,7 +3423,7 @@ def main(argv=None):
             }
 
         stage2_case = stage2_ctx['stage2_case']
-        baseline_row = stage2_ctx['baseline_row']
+        baseline_row = stage2_ctx.get('baseline_row') or {}
         shared_case = build_stage3_shared_structure(stage2_case, baseline_row)
         final_cloud = build_legacy_cloud_from_shared(shared_case)
         mrw_segments_list = extract_mrw_segments_from_cloud(final_cloud)

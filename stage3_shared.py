@@ -61,6 +61,71 @@ def _image_center(image_width: int, image_height: int) -> Tuple[float, float]:
     return float(image_width) / 2.0, float(image_height) / 2.0
 
 
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_image_shape(value: Any) -> Optional[Tuple[int, int]]:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        return int(value[0]), int(value[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _prefer_non_null(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _resolve_slice_lr_points(
+    slice_raw: Dict[str, Any],
+    *,
+    left_key: str,
+    right_key: str,
+    compat_key: str,
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    left_pt = slice_raw.get(left_key)
+    right_pt = slice_raw.get(right_key)
+    if left_pt is not None and right_pt is not None:
+        ordered = sorted(
+            [
+                (float(left_pt[0]), float(left_pt[1])),
+                (float(right_pt[0]), float(right_pt[1])),
+            ],
+            key=lambda item: item[0],
+        )
+        return ordered[0], ordered[-1]
+
+    compat_pts = slice_raw.get(compat_key)
+    if compat_pts is None:
+        raise KeyError(left_key)
+    ordered = sorted(
+        [(float(pt[0]), float(pt[1])) for pt in compat_pts],
+        key=lambda item: item[0],
+    )
+    return ordered[0], ordered[-1]
+
+
 def _split_full_ilm_for_legacy(slice_meta: SliceMeta) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
     pts = sorted(slice_meta.full_ilm_px, key=lambda item: item[0])
     left_cutoff_x = float(slice_meta.cutoff_left_px[0])
@@ -124,23 +189,34 @@ def pixel_to_3d(
 
 def build_stage3_shared_structure(
     stage2_case: Dict[str, Any],
-    baseline_row: Dict[str, Any],
+    baseline_row: Optional[Dict[str, Any]],
 ) -> Stage3SharedCase:
+    baseline_row = baseline_row or {}
     slices = sorted(stage2_case["slices"], key=lambda item: item["scan_index"])
     first = slices[0]
+    case_image_width = int(stage2_case.get("image_width", first["image_width"]))
+    case_image_height = int(stage2_case.get("image_height", first["image_height"]))
+    default_x_center, default_y_center = _image_center(case_image_width, case_image_height)
+    case_x_center = _coerce_optional_float(stage2_case.get("x_center"))
+    case_y_center = _coerce_optional_float(stage2_case.get("y_center"))
+    axial_length = _coerce_optional_float(stage2_case.get("axial_length"))
+    if axial_length is None:
+        axial_length = _coerce_optional_float(baseline_row.get("Axial_Length"))
+    if axial_length is None:
+        raise ValueError("axial_length is required from stage2 json or baseline fallback")
 
     case_meta = CaseMeta(
         case_id=str(stage2_case["case_id"]),
         patient_id=str(stage2_case["patient_id"]),
         laterality=str(stage2_case["laterality"]).strip().upper(),
-        axial_length=float(baseline_row["Axial_Length"]),
-        diagnosis=baseline_row.get("Diagnosis"),
-        stage=baseline_row.get("Stage"),
-        image_width=int(first["image_width"]),
-        image_height=int(first["image_height"]),
-        x_center=_image_center(int(first["image_width"]), int(first["image_height"]))[0],
-        y_center=_image_center(int(first["image_width"]), int(first["image_height"]))[1],
-        n_slices=N_SLICES,
+        axial_length=float(axial_length),
+        diagnosis=_prefer_non_null(stage2_case.get("diagnosis"), baseline_row.get("Diagnosis")),
+        stage=_prefer_non_null(stage2_case.get("stage"), baseline_row.get("Stage")),
+        image_width=case_image_width,
+        image_height=case_image_height,
+        x_center=case_x_center if case_x_center is not None else default_x_center,
+        y_center=case_y_center if case_y_center is not None else default_y_center,
+        n_slices=_coerce_optional_int(stage2_case.get("n_slices")) or len(slices),
     )
 
     slice_meta_list: List[SliceMeta] = []
@@ -153,26 +229,42 @@ def build_stage3_shared_structure(
     }
 
     for slice_raw in slices:
-        bmo_sorted = sorted(slice_raw["bmo_px"], key=lambda item: item[0])
-        cutoff_sorted = sorted(slice_raw["cutoff_px"], key=lambda item: item[0])
         scan_index = int(slice_raw["scan_index"])
         image_height = int(slice_raw["image_height"])
         image_width = int(slice_raw["image_width"])
-        x_center, y_center = _image_center(image_width, image_height)
+        default_slice_x_center, default_slice_y_center = _image_center(image_width, image_height)
+        image_shape = _coerce_optional_image_shape(slice_raw.get("image_shape")) or (image_height, image_width)
+        angle_deg = _coerce_optional_float(slice_raw.get("angle_deg"))
+        if angle_deg is None:
+            angle_deg = (scan_index - 1) * 15.0
+        x_center = case_x_center if case_x_center is not None else default_slice_x_center
+        y_center = case_y_center if case_y_center is not None else default_slice_y_center
+        bmo_left_px, bmo_right_px = _resolve_slice_lr_points(
+            slice_raw,
+            left_key="bmo_left_px",
+            right_key="bmo_right_px",
+            compat_key="bmo_px",
+        )
+        cutoff_left_px, cutoff_right_px = _resolve_slice_lr_points(
+            slice_raw,
+            left_key="cutoff_left_px",
+            right_key="cutoff_right_px",
+            compat_key="cutoff_px",
+        )
 
         slice_meta = SliceMeta(
             slice_id=scan_index,
             slice_stem=str(slice_raw["slice_stem"]),
             scan_index=scan_index,
-            angle_deg=(scan_index - 1) * 15.0,
-            image_shape=(image_height, image_width),
+            angle_deg=float(angle_deg),
+            image_shape=image_shape,
             x_center=x_center,
             y_center=y_center,
             full_ilm_px=list(slice_raw["full_ilm_px"]),
-            bmo_left_px=tuple(bmo_sorted[0]),
-            bmo_right_px=tuple(bmo_sorted[-1]),
-            cutoff_left_px=tuple(cutoff_sorted[0]),
-            cutoff_right_px=tuple(cutoff_sorted[-1]),
+            bmo_left_px=bmo_left_px,
+            bmo_right_px=bmo_right_px,
+            cutoff_left_px=cutoff_left_px,
+            cutoff_right_px=cutoff_right_px,
             rnfl_effective_lower_px=list(slice_raw["rnfl_effective_lower_px"]),
             review_status=slice_raw.get("review_status"),
             source_flags=slice_raw.get("source_flags", {}),

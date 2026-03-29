@@ -16,31 +16,52 @@ from stage3_input_adapter import (
 from stage3_shared import build_stage3_shared_structure
 
 
-def build_stage2_case_payload(n_slices=12):
+def build_stage2_case_payload(
+    n_slices=12,
+    *,
+    include_legacy_aliases=False,
+    include_axial_length=True,
+    angle_offset=0.0,
+):
     slices = []
     for scan_index in range(1, n_slices + 1):
         full_ilm = [[float(x), 20.0 + 0.1 * scan_index] for x in range(0, 10)]
-        slices.append(
-            {
-                "scan_index": scan_index,
-                "slice_stem": f"slice_{scan_index:02d}",
-                "image_width": 10,
-                "image_height": 100,
-                "full_ilm_px": full_ilm,
-                "bmo_px": [[3.0, 40.0], [6.0, 40.0]],
-                "cutoff_px": [[2.0, 35.0], [7.0, 35.0]],
-                "rnfl_effective_lower_px": [[2.0, 60.0], [4.0, 59.0], [7.0, 60.0]],
-                "review_status": "approved",
-                "source_flags": {"stage2_final": True},
-            }
-        )
-    return {
+        record = {
+            "scan_index": scan_index,
+            "slice_stem": f"slice_{scan_index:02d}",
+            "image_width": 10,
+            "image_height": 100,
+            "angle_deg": float((scan_index - 1) * 15.0 + angle_offset),
+            "image_shape": [100, 10],
+            "full_ilm_px": full_ilm,
+            "bmo_left_px": [3.0, 40.0],
+            "bmo_right_px": [6.0, 40.0],
+            "cutoff_left_px": [2.0, 35.0],
+            "cutoff_right_px": [7.0, 35.0],
+            "rnfl_effective_lower_px": [[2.0, 60.0], [4.0, 59.0], [7.0, 60.0]],
+            "review_status": "approved",
+            "source_flags": {"stage2_final": True},
+        }
+        if include_legacy_aliases:
+            record["bmo_px"] = [[3.0, 40.0], [6.0, 40.0]]
+            record["cutoff_px"] = [[2.0, 35.0], [7.0, 35.0]]
+        slices.append(record)
+
+    payload = {
         "stage2_schema_version": "v1",
         "case_id": "CASE-001",
         "patient_id": "P001",
         "laterality": "R",
+        "image_width": 10,
+        "image_height": 100,
+        "x_center": 5.0,
+        "y_center": 50.0,
+        "n_slices": n_slices,
         "slices": slices,
     }
+    if include_axial_length:
+        payload["axial_length"] = 24.0
+    return payload
 
 
 def load_stage3_main_module():
@@ -104,6 +125,38 @@ class Stage3InputAdapterTests(unittest.TestCase):
         self.assertEqual(loaded["case_id"], "CASE-001")
         self.assertEqual(loaded["laterality"], "R")
         self.assertEqual(len(loaded["slices"]), 12)
+        first_slice = loaded["slices"][0]
+        self.assertEqual(first_slice["bmo_left_px"], (3.0, 40.0))
+        self.assertEqual(first_slice["bmo_right_px"], (6.0, 40.0))
+        self.assertEqual(first_slice["cutoff_left_px"], (2.0, 35.0))
+        self.assertEqual(first_slice["cutoff_right_px"], (7.0, 35.0))
+
+    def test_load_stage2_case_accepts_split_fields_without_legacy_aliases(self):
+        payload = build_stage2_case_payload(include_legacy_aliases=False)
+        for item in payload["slices"]:
+            self.assertNotIn("bmo_px", item)
+            self.assertNotIn("cutoff_px", item)
+        with open(self.stage2_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+        loaded = load_stage2_case(str(self.stage2_json), expected_case_id="CASE-001")
+        self.assertEqual(len(loaded["slices"]), 12)
+        self.assertEqual(loaded["slices"][0]["bmo_px"], [(3.0, 40.0), (6.0, 40.0)])
+        self.assertEqual(loaded["slices"][0]["cutoff_px"], [(2.0, 35.0), (7.0, 35.0)])
+
+    def test_load_stage2_case_supports_legacy_alias_fallback(self):
+        payload = build_stage2_case_payload(include_legacy_aliases=True)
+        for item in payload["slices"]:
+            item.pop("bmo_left_px", None)
+            item.pop("bmo_right_px", None)
+            item.pop("cutoff_left_px", None)
+            item.pop("cutoff_right_px", None)
+        with open(self.stage2_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+        loaded = load_stage2_case(str(self.stage2_json), expected_case_id="CASE-001")
+        self.assertEqual(loaded["slices"][0]["bmo_left_px"], (3.0, 40.0))
+        self.assertEqual(loaded["slices"][0]["cutoff_right_px"], (7.0, 35.0))
 
     def test_validate_contract_requires_12_slices(self):
         payload = build_stage2_case_payload(n_slices=11)
@@ -148,19 +201,33 @@ class Stage3InputAdapterTests(unittest.TestCase):
             load_stage2_case(str(self.stage2_json), expected_case_id="CASE-001")
 
     def test_scan_index_and_angle_preserved(self):
+        payload = build_stage2_case_payload(angle_offset=7.5)
+        with open(self.stage2_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
         loaded = load_stage2_case(str(self.stage2_json), expected_case_id="CASE-001")
         baseline_row = load_patient_baseline_row(str(self.base_table), "P001", "R")
         shared_case = build_stage3_shared_structure(loaded, baseline_row)
 
         first_slice = shared_case.slice_meta_list[0]
         self.assertEqual(first_slice.scan_index, 1)
-        self.assertEqual(first_slice.angle_deg, 0.0)
+        self.assertEqual(first_slice.angle_deg, 7.5)
         self.assertEqual(first_slice.x_center, 5.0)
         self.assertEqual(first_slice.y_center, 50.0)
 
         last_slice = shared_case.slice_meta_list[-1]
         self.assertEqual(last_slice.scan_index, 12)
-        self.assertEqual(last_slice.angle_deg, 165.0)
+        self.assertEqual(last_slice.angle_deg, 172.5)
+
+    def test_shared_structure_falls_back_to_formula_angle_when_missing(self):
+        payload = build_stage2_case_payload()
+        payload["slices"][0].pop("angle_deg", None)
+        with open(self.stage2_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+        loaded = load_stage2_case(str(self.stage2_json), expected_case_id="CASE-001")
+        shared_case = build_stage3_shared_structure(loaded, {})
+        self.assertEqual(shared_case.slice_meta_list[0].angle_deg, 0.0)
 
     def test_build_shared_structure_contains_case_slice_compute_levels(self):
         loaded = load_stage2_case(str(self.stage2_json), expected_case_id="CASE-001")
@@ -201,6 +268,10 @@ class Stage3InputAdapterTests(unittest.TestCase):
             module,
             "load_legacy_labelme_case",
             side_effect=AssertionError("load_legacy_labelme_case should not be called in stage2 mode"),
+        ), mock.patch.object(
+            module,
+            "load_patient_baseline_row",
+            side_effect=AssertionError("load_patient_baseline_row should not be called when base-table is omitted"),
         ), mock.patch.object(module, "align_to_bmo_bfp") as mock_align, mock.patch.object(
             module, "prepare_mrw_dataframe", return_value=pd.DataFrame()
         ), mock.patch.object(
@@ -226,8 +297,6 @@ class Stage3InputAdapterTests(unittest.TestCase):
                     "stage2",
                     "--stage2-json",
                     str(self.stage2_json),
-                    "--base-table",
-                    str(self.base_table),
                     "--case-id",
                     "CASE-001",
                     "--patient-id",
@@ -247,6 +316,36 @@ class Stage3InputAdapterTests(unittest.TestCase):
         self.assertEqual(first_slice["rotation_center_px"], [5.0, 50.0])
         self.assertEqual(first_slice["center_source"], "image_center")
         self.assertEqual(captured["cloud"]["z_stabilization_status"], "inactive_stage2_no_z_correction")
+
+    def test_stage2_mode_fails_without_base_table_when_axial_length_missing(self):
+        module = load_stage3_main_module()
+        payload = build_stage2_case_payload(include_axial_length=False)
+        with open(self.stage2_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+        result = module.main(
+            [
+                "--input-mode",
+                "stage2",
+                "--stage2-json",
+                str(self.stage2_json),
+                "--case-id",
+                "CASE-001",
+                "--patient-id",
+                "P001",
+                "--laterality",
+                "R",
+                "--output-dir",
+                str(self.root / "out_missing_axial"),
+            ]
+        )
+
+        self.assertEqual(result["status"], "SELF_CHECK_FAILED")
+        checks = {
+            row["Check"]: row["Status"]
+            for _, row in result["self_check"].iterrows()
+        }
+        self.assertEqual(checks["stage2:axial_length_available"], "FAIL")
 
     def test_stage2_mode_does_not_require_center_ilm(self):
         module = load_stage3_main_module()
