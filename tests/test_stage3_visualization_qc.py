@@ -10,14 +10,9 @@ from stage3_visualization import save_stage3_qc_3d_views
 
 def load_stage3_main_module():
     root = Path(__file__).resolve().parents[1]
-    candidates = [
-        path
-        for path in root.glob("*.py")
-        if path.name not in {"stage3_input_adapter.py", "stage3_shared.py", "stage3_canonical_access.py", "stage3_visualization.py"}
-        and "pre" not in path.name.lower()
-    ]
-    assert len(candidates) == 1
-    spec = importlib.util.spec_from_file_location("stage3_main_module", str(candidates[0]))
+    target = root / "zuizhong.py"
+    assert target.is_file()
+    spec = importlib.util.spec_from_file_location("stage3_main_module", str(target))
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
