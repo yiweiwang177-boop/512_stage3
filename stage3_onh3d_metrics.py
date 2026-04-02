@@ -173,6 +173,52 @@ def _finite_numeric_values(values: Any) -> np.ndarray:
     return arr[np.isfinite(arr)]
 
 
+def _triangle_closest_point(point: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
+    """Return the closest point on triangle ABC to the query point."""
+
+    ab = b - a
+    ac = c - a
+    ap = point - a
+
+    d1 = float(np.dot(ab, ap))
+    d2 = float(np.dot(ac, ap))
+    if d1 <= 0.0 and d2 <= 0.0:
+        return a
+
+    bp = point - b
+    d3 = float(np.dot(ab, bp))
+    d4 = float(np.dot(ac, bp))
+    if d3 >= 0.0 and d4 <= d3:
+        return b
+
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+        v = d1 / (d1 - d3)
+        return a + v * ab
+
+    cp = point - c
+    d5 = float(np.dot(ab, cp))
+    d6 = float(np.dot(ac, cp))
+    if d6 >= 0.0 and d5 <= d6:
+        return c
+
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+        w = d2 / (d2 - d6)
+        return a + w * ac
+
+    va = d3 * d6 - d5 * d4
+    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+        bc = c - b
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        return b + w * bc
+
+    denom = 1.0 / (va + vb + vc)
+    v = vb * denom
+    w = vc * denom
+    return a + ab * v + ac * w
+
+
 def _sector_names_from_theta(theta_ref_deg: float, case: ONH3DCase) -> tuple[Optional[str], Optional[str], Optional[str]]:
     if theta_ref_deg is None or not np.isfinite(theta_ref_deg):
         return None, None, None
@@ -415,16 +461,95 @@ def select_valid_connection(
 ) -> Optional[Dict[str, Any]]:
     """Select a valid local BMO-to-ILM connection candidate.
 
-    The future implementation must search within the local measurement plane
-    and local narrow band, enforcing validity/continuity based on the geometry
-    defined along the continuous ring. Smoothness must arise from the ring and
-    local-frame definition itself, not from post-hoc numeric smoothing. Any
-    future continuity rule may constrain candidate selection, but must never
-    redefine `phi_deg`.
+    V1 uses the canonical ILM triangle mesh directly. Candidate faces are
+    limited to a narrow slab around the local measurement plane, the closest
+    point on each candidate triangle is evaluated, and the shortest connection
+    on the positive local measurement side is kept. Smoothness comes from the
+    continuous ring/local-frame definition and the periodic sampling; this
+    function only selects a valid local connection and never redefines
+    `phi_deg = angle(connection_vec, tangent)`.
     """
 
-    del sample, case, config
-    return None
+    vertices = np.asarray(case.ilm_surface.vertices_3d, dtype=float)
+    faces = np.asarray(case.ilm_surface.faces, dtype=int)
+    origin = np.asarray(sample.local_frame.origin_3d, dtype=float)
+    plane_normal = _normalize_vector(sample.local_frame.plane_normal_3d)
+    plane_y = _normalize_vector(sample.local_frame.plane_y_axis_3d)
+
+    band_radius = float(config.local_band_radius_mm) if config.local_band_radius_mm is not None else max(
+        0.05,
+        float(sample.delta_s_mm) * 0.5,
+    )
+    max_connection_length = (
+        float(config.max_connection_length_mm)
+        if config.max_connection_length_mm is not None
+        else None
+    )
+
+    best: Optional[Dict[str, Any]] = None
+    rejected_due_to_direction = 0
+    rejected_due_to_length = 0
+    rejected_due_to_band = 0
+
+    for face in faces:
+        tri = vertices[np.asarray(face, dtype=int)]
+        signed_dist = np.dot(tri - origin, plane_normal)
+        min_signed = float(np.min(signed_dist))
+        max_signed = float(np.max(signed_dist))
+        # The candidate face must intersect the local measurement-plane slab.
+        if min_signed > band_radius or max_signed < -band_radius:
+            continue
+
+        closest = _triangle_closest_point(origin, tri[0], tri[1], tri[2])
+        connection_vec = closest - origin
+        length_mm = float(np.linalg.norm(connection_vec))
+        if not np.isfinite(length_mm) or length_mm <= 0.0:
+            continue
+
+        plane_offset = abs(float(np.dot(connection_vec, plane_normal)))
+        if plane_offset > band_radius:
+            rejected_due_to_band += 1
+            continue
+
+        # Valid connections must remain on the positive measurement side of the
+        # local frame. This filters back-facing or opposite-side candidates
+        # without changing phi = angle(connection, tangent).
+        if float(np.dot(connection_vec, plane_y)) <= 0.0:
+            rejected_due_to_direction += 1
+            continue
+
+        if max_connection_length is not None and length_mm > max_connection_length:
+            rejected_due_to_length += 1
+            continue
+
+        candidate = {
+            "is_valid": True,
+            "ilm_point_3d": closest,
+            "connection_vec_3d": connection_vec,
+            "connection_length_mm": length_mm,
+            "plane_offset_mm": plane_offset,
+        }
+        if best is None:
+            best = candidate
+            continue
+        if length_mm < float(best["connection_length_mm"]) - 1e-9:
+            best = candidate
+            continue
+        if abs(length_mm - float(best["connection_length_mm"])) <= 1e-9 and plane_offset < float(best["plane_offset_mm"]):
+            best = candidate
+
+    if best is not None:
+        return best
+
+    if rejected_due_to_direction:
+        reason = "no_candidate_on_positive_measurement_side"
+    elif rejected_due_to_band:
+        reason = "no_candidate_within_local_plane_band"
+    elif rejected_due_to_length:
+        reason = "no_candidate_within_max_connection_length"
+    else:
+        reason = "no_candidate_face_in_local_band"
+    return {"is_valid": False, "invalid_reason": reason}
 
 
 def compute_local_metric(

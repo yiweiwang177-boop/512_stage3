@@ -143,15 +143,6 @@ def _sector_summary_rows(metrics_result: ONH3DMetricResult) -> list[Dict[str, An
     return rows
 
 
-def _master_sector_rows(sector_df: pd.DataFrame) -> pd.DataFrame:
-    if sector_df is None or len(sector_df) == 0:
-        return pd.DataFrame(columns=["source_table", "level", "sector_name", "metric_name", "mean_value", "count"])
-
-    keep = sector_df[sector_df["metric_name"].isin(["MRW_um", "MRA_local_area_mm2"])].copy()
-    keep["mean_value"] = pd.to_numeric(keep["value"], errors="coerce")
-    return keep[["source_table", "level", "sector_name", "metric_name", "mean_value", "count"]]
-
-
 def build_onh3d_report_meta(
     case: ONH3DCase,
     metrics_result: Optional[ONH3DMetricResult] = None,
@@ -204,7 +195,6 @@ def adapt_onh3d_metrics_to_stage3_tables(
             "mra_df": mra_df,
             "sector_df": sector_df,
             "report_meta": report_meta,
-            "master_sector_df": _master_sector_rows(sector_df),
         }
 
     mrw_rows = []
@@ -276,5 +266,4 @@ def adapt_onh3d_metrics_to_stage3_tables(
         "mra_df": mra_df,
         "sector_df": sector_df,
         "report_meta": report_meta,
-        "master_sector_df": _master_sector_rows(sector_df),
     }

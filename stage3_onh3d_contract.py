@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
-from stage3_reporting import SECTOR_2_MAP, SECTOR_4_MAP, SECTOR_8_BOUNDS
+from stage3_sector_reference import SECTOR_2_MAP, SECTOR_4_MAP, SECTOR_8_BOUNDS
 
 
 @dataclass

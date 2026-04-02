@@ -158,6 +158,7 @@ class Stage3ONH3DReportAdapterTests(unittest.TestCase):
         self.assertEqual(adapted["mra_df"].iloc[0]["local_area_mm2"], 0.456)
         self.assertEqual(adapted["sector_df"].iloc[2]["aggregation_method"], "sum")
         self.assertEqual(adapted["report_meta"]["mra_sector_aggregation"], "sum")
+        self.assertNotIn("master_sector_df", adapted)
 
 
 if __name__ == "__main__":

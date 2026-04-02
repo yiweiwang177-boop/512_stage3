@@ -55,19 +55,20 @@ def build_case(*, clockwise_positive=True):
         ilm_surface=ILMSurfaceModel(
             vertices_3d=np.array(
                 [
-                    [0.0, 0.0, 1.0],
-                    [1.0, 0.0, 1.0],
-                    [0.0, 1.0, 1.0],
+                    [-2.0, -2.0, 1.0],
+                    [2.0, -2.0, 1.0],
+                    [2.0, 2.0, 1.0],
+                    [-2.0, 2.0, 1.0],
                 ],
                 dtype=float,
             ),
-            faces=np.array([[0, 1, 2]], dtype=int),
+            faces=np.array([[0, 1, 2], [0, 2, 3]], dtype=int),
         ),
         qc_meta=ONH3DQCMeta(
             bmo_ring_closed=True,
             bmo_ring_sampling_count=16,
-            ilm_surface_vertex_count=3,
-            ilm_surface_face_count=1,
+            ilm_surface_vertex_count=4,
+            ilm_surface_face_count=2,
             bmo_plane_fit_rms_mm=0.0,
             notes=[],
         ),
@@ -205,18 +206,18 @@ class Stage3ONH3DMetricsTests(unittest.TestCase):
             0.789,
         )
 
-    def test_compute_onh3d_metrics_returns_complete_invalid_skeleton_without_connections(self):
+    def test_compute_onh3d_metrics_returns_valid_metrics_for_planar_ilm_case(self):
         case = build_case()
         result = compute_onh3d_metrics(case)
         self.assertEqual(result.total_sample_count, 128)
-        self.assertEqual(result.valid_sample_count, 0)
-        self.assertTrue(np.isnan(result.MRW_global_mean_um))
-        self.assertTrue(np.isnan(result.MRW_global_min_um))
-        self.assertTrue(np.isnan(result.MRW_global_low10_mean_um))
-        self.assertEqual(result.MRA_global_sum_mm2, 0.0)
+        self.assertGreater(result.valid_sample_count, 0)
+        self.assertTrue(np.isfinite(result.MRW_global_mean_um))
+        self.assertTrue(np.isfinite(result.MRW_global_min_um))
+        self.assertTrue(np.isfinite(result.MRW_global_low10_mean_um))
+        self.assertGreater(result.MRA_global_sum_mm2, 0.0)
         self.assertEqual(len(result.ring_samples), 128)
         self.assertEqual(len(result.detail), 128)
-        self.assertEqual(result.sector_summary_8, {})
+        self.assertTrue(result.sector_summary_8)
 
 
 if __name__ == "__main__":
