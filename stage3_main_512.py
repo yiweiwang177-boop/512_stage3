@@ -89,6 +89,21 @@ def _derive_bmo_plane(bmo_ring_3d: np.ndarray, payload: Dict[str, Any], notes: l
     )
 
 
+def _extract_bmo_ring_vertices(payload: Dict[str, Any], notes: list[str]) -> np.ndarray:
+    ring_payload = payload.get("bmo_ring_3d")
+    if ring_payload is None:
+        raise ValueError("bmo_ring_3d is required")
+
+    if isinstance(ring_payload, dict):
+        vertices = ring_payload.get("vertices_3d")
+        if vertices is None:
+            raise ValueError("bmo_ring_3d.vertices_3d is required for canonical artifacts")
+        return np.asarray(vertices, dtype=float)
+
+    notes.append("bmo_ring_3d_noncanonical_array_fallback_used")
+    return np.asarray(ring_payload, dtype=float)
+
+
 def _build_sector_reference(payload: Dict[str, Any], bmo_plane: BMOPlane, notes: list[str]) -> SectorReference:
     sector_payload = payload.get("sector_reference") or {}
     if "sector_reference" not in payload:
@@ -171,7 +186,9 @@ def load_onh3d_case(case_path: Optional[str]) -> ONH3DCase:
     """Load a normalized 512 ONH3D JSON case into the canonical contract.
 
     Preferred input is the canonical Stage1/2 `onh3d_case.json` artifact with
-    explicit `bmo_plane`, `sector_reference`, `transform_info`, and `qc_meta`.
+    structured geometry objects such as `bmo_ring_3d.vertices_3d`,
+    `ilm_surface.vertices_3d`, `ilm_surface.faces`, plus explicit
+    `bmo_plane`, `sector_reference`, `transform_info`, and `qc_meta`.
     The loader still supports minimal omissions as a compatibility fallback,
     but those derived defaults are a secondary path and are recorded in
     `source_meta["loader_defaults_applied"]`.
@@ -187,11 +204,10 @@ def load_onh3d_case(case_path: Optional[str]) -> ONH3DCase:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
 
-    bmo_ring_3d = np.asarray(payload.get("bmo_ring_3d"), dtype=float)
+    notes: list[str] = []
+    bmo_ring_3d = _extract_bmo_ring_vertices(payload, notes)
     if bmo_ring_3d.ndim != 2 or bmo_ring_3d.shape[1] != 3 or bmo_ring_3d.shape[0] < 3:
         raise ValueError("bmo_ring_3d is required and must have shape (N,3) with N>=3")
-
-    notes: list[str] = []
     bmo_plane = _derive_bmo_plane(bmo_ring_3d, payload, notes)
     sector_reference = _build_sector_reference(payload, bmo_plane, notes)
     transform_info = _build_transform_info(payload, notes)
@@ -201,6 +217,13 @@ def load_onh3d_case(case_path: Optional[str]) -> ONH3DCase:
     source_meta = dict(payload.get("source_meta") or {})
     source_meta["loader_contract"] = "onh3d_case_json_v1"
     source_meta["loader_path"] = str(path)
+    if isinstance(payload.get("bmo_ring_3d"), dict):
+        source_meta["loader_bmo_ring_geometry_source"] = "bmo_ring_3d.vertices_3d"
+        source_meta["loader_bmo_ring_metadata"] = {
+            key: value
+            for key, value in payload.get("bmo_ring_3d", {}).items()
+            if key != "vertices_3d"
+        }
     if notes:
         source_meta["loader_defaults_applied"] = list(notes)
 

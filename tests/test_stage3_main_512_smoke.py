@@ -25,16 +25,20 @@ def build_minimal_onh3d_payload():
         "axial_length": 24.1,
         "algorithm_version": "smoke-v1",
         "geometry_model": "true_3d_onh",
-        "bmo_ring_3d": [
-            [1.0, 0.0, 0.0],
-            [0.7071, 0.7071, 0.0],
-            [0.0, 1.0, 0.0],
-            [-0.7071, 0.7071, 0.0],
-            [-1.0, 0.0, 0.0],
-            [-0.7071, -0.7071, 0.0],
-            [0.0, -1.0, 0.0],
-            [0.7071, -0.7071, 0.0],
-        ],
+        "bmo_ring_3d": {
+            "vertices_3d": [
+                [1.0, 0.0, 0.0],
+                [0.7071, 0.7071, 0.0],
+                [0.0, 1.0, 0.0],
+                [-0.7071, 0.7071, 0.0],
+                [-1.0, 0.0, 0.0],
+                [-0.7071, -0.7071, 0.0],
+                [0.0, -1.0, 0.0],
+                [0.7071, -0.7071, 0.0],
+            ],
+            "world_frame": "patient_mm",
+            "notes": ["canonical_ring_structure"],
+        },
         "ilm_surface": {
             "vertices_3d": [
                 [-2.0, -2.0, 1.0],
@@ -109,6 +113,8 @@ class Stage3Main512SmokeTests(unittest.TestCase):
         self.assertIsInstance(case, ONH3DCase)
         validate_onh3d_case(case)
         self.assertEqual(case.source_meta["loader_contract"], "onh3d_case_json_v1")
+        self.assertEqual(case.source_meta["loader_bmo_ring_geometry_source"], "bmo_ring_3d.vertices_3d")
+        self.assertIn("world_frame", case.source_meta["loader_bmo_ring_metadata"])
         self.assertNotIn("loader_defaults_applied", case.source_meta)
 
         metrics_result = compute_onh3d_metrics(case)
